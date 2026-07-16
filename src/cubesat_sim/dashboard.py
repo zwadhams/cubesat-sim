@@ -35,52 +35,84 @@ from cubesat_sim.environment.sun import sun_direction_eci
 from cubesat_sim.faults import SAA_LAT_DEG, SAA_LON_DEG
 from cubesat_sim.physics.spacecraft import DEFAULT_STATION, DEFAULT_TARGETS
 
-# analog lanes: (title, unit, fixed y-domain or None, series)
+# analog lanes: (title, section, hint, unit, fixed y-domain or None, series)
 # each series: (source, key, label, transform)
 _K2C = ("kelvin", lambda v: v - 273.15)
 _ID = (None, None)
 ANALOG_LANES = [
-    ("State of charge", "fraction", (0.0, 1.0), [
+    ("State of charge", "Power & thermal",
+     "Truth, the sag-biased onboard estimate, and the ground's snapshot "
+     "(which only updates during passes).",
+     "fraction", (0.0, 1.0), [
         ("physics", "soc_true", "true", _ID),
         ("eps", "soc_est", "EPS estimate", _ID),
         ("ground", "sat_soc_est", "ground last heard", _ID),
     ]),
-    ("Electrical power", "W", None, [
+    ("Electrical power", "Power & thermal",
+     "Generation follows sun-pointing and eclipse; load follows whatever "
+     "is switched on (payload, heater, radio TX).",
+     "W", None, [
         ("physics", "p_gen_w", "generation", _ID),
         ("physics", "p_load_w", "load", _ID),
     ]),
-    ("Battery voltage", "V", None, [
+    ("Battery voltage", "Power & thermal",
+     "Sags under discharge, rises under charge — the raw (and misleading) "
+     "signal behind the SoC estimate.",
+     "V", None, [
         ("physics", "battery_v_true", "true", _ID),
     ]),
-    ("Temperatures", "°C", None, [
+    ("Temperatures", "Power & thermal",
+     "Li-ion cells must stay above 0 °C to charge; the battery heater "
+     "spends watts to keep them there.",
+     "°C", None, [
         ("physics", "t_batt_k", "battery", _K2C),
         ("physics", "t_struct_k", "structure", _K2C),
     ]),
-    ("Body rate", "deg/s", None, [
+    ("Body rate", "Attitude",
+     "How fast the satellite is rotating. The ADCS estimate freezes if "
+     "its gyro latches up — watch for the two lines splitting.",
+     "deg/s", None, [
         ("physics", "rate_dps", "true", _ID),
         ("adcs", "rate_dps", "ADCS estimate", _ID),
     ]),
-    ("Sun facing", "cosine", (-1.0, 1.0), [
+    ("Sun facing", "Attitude",
+     "Cosine of the panel-to-sun angle: 1 is full sun on the array, "
+     "0 edge-on, negative is anti-sun. Generation follows this.",
+     "cosine", (-1.0, 1.0), [
         ("physics", "sun_facing", "panel · sun", _ID),
     ]),
-    ("Wheel momentum", "frac of max", (0.0, 1.0), [
+    ("Wheel momentum", "Attitude",
+     "Momentum stored in the reaction wheels; near 1.0 they saturate and "
+     "the magnetorquers must dump momentum.",
+     "frac of max", (0.0, 1.0), [
         ("physics", "wheel_h_frac", "true", _ID),
         ("adcs", "wheel_frac", "ADCS estimate", _ID),
     ]),
-    ("Data", "MB", None, [
+    ("Data", "Data & link",
+     "Imaging fills the onboard queue; passes drain it to the ground "
+     "archive; overflow when full is dropped forever.",
+     "MB", None, [
         ("comms", "queue_mb", "onboard queue", _ID),
         ("ground", "archive_mb", "ground archive", _ID),
         ("comms", "dropped_mb", "dropped", _ID),
     ]),
-    ("Link", "count", None, [
+    ("Link", "Data & link",
+     "Cumulative counts: frames the ground rejected (CRC), frame-counter "
+     "gaps it noticed, and command retransmissions.",
+     "count", None, [
         ("ground", "frames_rejected", "frames rejected", _ID),
         ("ground", "seq_gaps", "sequence gaps", _ID),
         ("ground", "tc_retransmits", "TC retransmits", _ID),
     ]),
-    ("Battery capacity", "Wh", None, [
+    ("Battery capacity", "Degradation",
+     "Cycle aging: every watt-hour through the pack shrinks the tank a "
+     "little.",
+     "Wh", None, [
         ("physics", "batt_capacity_wh", "capacity", _ID),
     ]),
-    ("Array health", "illumination", None, [
+    ("Array health", "Degradation",
+     "Radiation darkening in sunlight, plus any debris strikes.",
+     "illumination", None, [
         ("physics", "array_illum", "illumination", _ID),
     ]),
 ]
@@ -187,7 +219,7 @@ def load_flight(db_path: str | Path) -> dict:
         period = CircularOrbit().period_s
 
         lanes = []
-        for title, unit, domain, series_spec in ANALOG_LANES:
+        for title, section, hint, unit, domain, series_spec in ANALOG_LANES:
             series = []
             for source, key, label, (_, transform) in series_spec:
                 pts = _series(db, source, key)
@@ -198,7 +230,8 @@ def load_flight(db_path: str | Path) -> dict:
                 series.append({"label": label,
                                "points": _downsample(pts)})
             if series:
-                lanes.append({"title": title, "unit": unit,
+                lanes.append({"title": title, "section": section,
+                              "hint": hint, "unit": unit,
                               "domain": list(domain) if domain else None,
                               "series": series})
 
@@ -334,6 +367,7 @@ _TEMPLATE = r"""<!doctype html>
   --s1: #2a78d6; --s2: #008300; --s3: #e87ba4; --s4: #eda100;
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
   --band: rgba(11,11,11,0.045);
+  --bandc: rgba(42,120,214,0.07);
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
@@ -344,6 +378,7 @@ _TEMPLATE = r"""<!doctype html>
     --border: rgba(255,255,255,0.10);
     --s1: #3987e5; --s2: #008300; --s3: #d55181; --s4: #c98500;
     --band: rgba(255,255,255,0.055);
+    --bandc: rgba(57,135,229,0.13);
   }
 }
 :root[data-theme="dark"] {
@@ -354,6 +389,7 @@ _TEMPLATE = r"""<!doctype html>
   --border: rgba(255,255,255,0.10);
   --s1: #3987e5; --s2: #008300; --s3: #d55181; --s4: #c98500;
   --band: rgba(255,255,255,0.055);
+  --bandc: rgba(57,135,229,0.13);
 }
 * { box-sizing: border-box; }
 body {
@@ -380,6 +416,27 @@ header button {
 .card { background: var(--surface); border: 1px solid var(--border);
         border-radius: 10px; padding: 12px 14px 10px; margin-bottom: 12px; }
 .card h2 { font-size: 13px; font-weight: 650; margin: 0 0 8px; color: var(--ink); }
+.card-head { display: flex; align-items: baseline; gap: 10px; }
+.card-head h2 { margin-bottom: 8px; }
+.card-head .zinfo { font-size: 11.5px; color: var(--muted); }
+.card-head button { margin-left: auto; font: inherit; font-size: 11.5px;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px; padding: 1px 9px;
+  cursor: pointer; }
+.intro { background: var(--surface); border: 1px solid var(--border);
+         border-radius: 10px; padding: 4px 14px; margin: 0 0 12px;
+         color: var(--ink-2); font-size: 13px; }
+.intro summary { font-weight: 650; color: var(--ink); font-size: 13px;
+                 padding: 8px 0; cursor: pointer; }
+.intro ul { margin: 6px 0 10px; padding-left: 20px; }
+.intro li { margin: 3px 0; }
+.intro .gloss { display: grid; grid-template-columns: max-content 1fr;
+                gap: 3px 12px; margin: 6px 0 12px; }
+.intro .gloss b { color: var(--ink); font-weight: 600; white-space: nowrap; }
+.section-head { font-size: 11px; font-weight: 650; letter-spacing: 0.08em;
+                text-transform: uppercase; color: var(--muted);
+                margin: 16px 2px 4px; }
+.lane .hint { font-size: 11.5px; color: var(--muted); margin: 0 2px 2px; }
 .lane { margin-bottom: 2px; }
 .lane-head { display: flex; align-items: baseline; gap: 8px; margin: 6px 2px 0; }
 .lane-head .t { font-size: 12.5px; font-weight: 650; }
@@ -436,11 +493,59 @@ td.num { font-variant-numeric: tabular-nums; }
     <span class="chips" id="chips"></span>
     <button id="themebtn" type="button">theme: auto</button>
   </header>
+  <details class="intro">
+    <summary>How to read this report</summary>
+    <ul>
+      <li><strong>Top to bottom:</strong> headline numbers, the orbit
+        replay, on/off state channels, discrete events, then continuous
+        telemetry lanes. Everything shares one time axis, measured in
+        orbits (~94 min each).</li>
+      <li><strong>Gray bands</strong> are eclipse (no sun, no power
+        generation). <strong>Blue bands</strong> are ground-station
+        contact — the only minutes when data goes down or commands go
+        up. Everything the ground knows and does happens inside the
+        blue.</li>
+      <li><strong>Hover anywhere</strong> for a crosshair across every
+        chart with exact values. If the orbit replay is paused, the
+        satellite follows your crosshair.</li>
+      <li><strong>Drag horizontally</strong> on any chart to zoom every
+        chart to that window; <strong>double-click</strong> (or the
+        reset button) to zoom back out.</li>
+      <li>Event glyphs: <strong>▲ critical</strong>, <strong>◆
+        warning</strong>, <strong>● recovery/good</strong>, ○ neutral.
+        The full list with details is in the event log below.</li>
+    </ul>
+    <div class="gloss">
+      <b>SoC</b><span>state of charge — battery fill fraction, 0 to 1</span>
+      <b>pass</b><span>the few minutes the satellite is above the ground
+        station's horizon</span>
+      <b>safe mode</b><span>OBC protective mode: payload off to save
+        power</span>
+      <b>load shed</b><span>EPS's own last-ditch veto: non-essential
+        loads forced off at very low SoC</span>
+      <b>charge inhibit</b><span>li-ion cells must not charge below
+        0 °C, even in full sun</span>
+      <b>FDIR</b><span>fault detection, isolation, recovery — here, a
+        gyro watchdog that power-cycles the ADCS</span>
+      <b>SAA</b><span>South Atlantic Anomaly: a radiation hotspot where
+        bit-flip (SEU) rates jump ~25×</span>
+      <b>VC0 / VC1</b><span>virtual channels on the radio link:
+        housekeeping beacons / bulk science data</span>
+      <b>CRC reject</b><span>a frame corrupted by channel noise, caught
+        by its checksum and discarded</span>
+      <b>sequence gap</b><span>a jump in the frame counters — proof
+        that frames went missing</span>
+    </div>
+  </details>
   <section class="tiles" id="tiles"></section>
   <div class="card" id="orbitcard"><h2>Orbit</h2><div id="orbit"></div></div>
-  <div class="card"><h2>State channels</h2><div id="tracks"></div></div>
+  <div class="card"><h2>State channels</h2><div id="xaxis-top"></div>
+    <div id="tracks"></div></div>
   <div class="card"><h2>Events</h2><div id="events"></div></div>
-  <div class="card"><h2>Telemetry</h2><div id="lanes"></div><div id="xaxis"></div></div>
+  <div class="card">
+    <div class="card-head"><h2>Telemetry</h2><span class="zinfo" id="zinfo"></span>
+      <button id="zoomreset" type="button" hidden>reset zoom</button></div>
+    <div id="lanes"></div><div id="xaxis"></div></div>
   <div class="card"><h2>Event log</h2><div id="evtable"></div></div>
 </div>
 <div id="tooltip"></div>
@@ -449,7 +554,8 @@ td.num { font-variant-numeric: tabular-nums; }
 "use strict";
 var DATA = JSON.parse(document.getElementById("flight-data").textContent);
 var PERIOD = DATA.meta.period_s, T_END = Math.max(DATA.meta.duration_s, 1);
-var PADL = 52, PADR = 14;
+var VIEW = { t0: 0, t1: T_END };  // zoom window; survives rebuilds
+var PADL = 112, PADR = 14;        // label gutter; recomputed per build
 var SERIES = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)"];
 var SEV = { critical: "var(--critical)", warning: "var(--warning)",
             good: "var(--good)", neutral: "var(--muted)" };
@@ -483,28 +589,52 @@ function niceStep(span, n) {
   var r = raw / mag;
   return (r >= 5 ? 10 : r >= 2 ? 5 : r >= 1 ? 2 : 1) * mag;
 }
-function xOf(t, plotW) { return PADL + (t / T_END) * plotW; }
+function viewSpan() { return VIEW.t1 - VIEW.t0; }
+function xOf(t, plotW) {
+  return PADL + ((t - VIEW.t0) / viewSpan()) * plotW;
+}
+function orbitStep() {
+  var span = viewSpan() / PERIOD;
+  return span > 6 ? 1 : span > 2.5 ? 0.5 : span > 1.2 ? 0.25 : 0.1;
+}
 
 function laneWidth() {
   return document.getElementById("lanes").clientWidth;
 }
 
-/* eclipse shading behind a plot area */
+/* truncate an SVG text node to a pixel budget, with an ellipsis; the
+ * tooltip always carries the full name */
+function fitText(node, maxW) {
+  var s = node.textContent;
+  while (s.length > 3 && node.getComputedTextLength() > maxW) {
+    s = s.slice(0, -1);
+    node.textContent = s + "…";
+  }
+}
+
+/* context shading behind every plot area: gray = eclipse, blue = the
+   minutes of ground-station contact — the only time the link exists */
 function drawBands(svg, plotW, h) {
-  var ecl = null;
-  for (var i = 0; i < DATA.tracks.length; i++)
-    if (DATA.tracks[i].label === "eclipse") ecl = DATA.tracks[i].intervals;
-  if (!ecl) return;
-  ecl.forEach(function (iv) {
-    el("rect", { x: xOf(iv[0], plotW), y: 0,
-                 width: Math.max(1, xOf(iv[1], plotW) - xOf(iv[0], plotW)),
-                 height: h, fill: "var(--band)" }, svg);
+  [["eclipse", "var(--band)"],
+   ["ground contact", "var(--bandc)"]].forEach(function (spec) {
+    DATA.tracks.forEach(function (tr) {
+      if (tr.label !== spec[0]) return;
+      tr.intervals.forEach(function (iv) {
+        if (iv[1] < VIEW.t0 || iv[0] > VIEW.t1) return;
+        var x0 = Math.max(PADL, xOf(iv[0], plotW));
+        var x1 = Math.min(PADL + plotW, xOf(iv[1], plotW));
+        el("rect", { x: x0, y: 0, width: Math.max(1, x1 - x0),
+                     height: h, fill: spec[1] }, svg);
+      });
+    });
   });
 }
 
 function orbitGrid(svg, plotW, h) {
-  var step = T_END / PERIOD > 6 ? 1 : 0.5;
-  for (var o = step; o < T_END / PERIOD; o += step) {
+  var step = orbitStep();
+  var o0 = Math.ceil(VIEW.t0 / PERIOD / step) * step;
+  for (var o = o0; o * PERIOD <= VIEW.t1 + 1e-9; o += step) {
+    if (o <= 0) continue;
     var x = xOf(o * PERIOD, plotW);
     el("line", { x1: x, y1: 0, x2: x, y2: h,
                  stroke: "var(--grid)", "stroke-width": 1 }, svg);
@@ -525,10 +655,13 @@ function drawTracks() {
     var y = i * ROW + 3;
     var t = el("text", { x: PADL - 8, y: y + 10, "text-anchor": "end",
                          "class": "rowlab" }, svg);
-    t.textContent = tr.label;
+    t.textContent = tr.label + " ×" + tr.intervals.length;
+    fitText(t, PADL - 12);
     tr.intervals.forEach(function (iv) {
-      el("rect", { x: xOf(iv[0], plotW), y: y,
-                   width: Math.max(1.5, xOf(iv[1], plotW) - xOf(iv[0], plotW)),
+      if (iv[1] < VIEW.t0 || iv[0] > VIEW.t1) return;
+      var x0 = Math.max(PADL, xOf(iv[0], plotW));
+      var x1 = Math.min(PADL + plotW, xOf(iv[1], plotW));
+      el("rect", { x: x0, y: y, width: Math.max(1.5, x1 - x0),
                    height: ROW - 5, rx: 2, fill: "var(--s1)",
                    opacity: 0.55 }, svg);
     });
@@ -580,12 +713,14 @@ function drawEvents() {
     var t = el("text", { x: PADL - 8, y: i * ROW + 16, "text-anchor": "end",
                          "class": "rowlab" }, svg);
     t.textContent = s;
+    fitText(t, PADL - 12);
   });
   DATA.events.forEach(function (e) {
+    if (e.t < VIEW.t0 || e.t > VIEW.t1) return;
     glyph(svg, xOf(e.t, plotW), sources.indexOf(e.source) * ROW + 12.5, e.severity);
   });
   attachCrosshair(svg, plotW, H, function (tt, tHover) {
-    var win = T_END / 90;
+    var win = viewSpan() / 90;
     var near = DATA.events.filter(function (e) {
       return Math.abs(e.t - tHover) < win; }).slice(0, 8);
     near.forEach(function (e) {
@@ -612,6 +747,10 @@ function drawLane(lane) {
       item.appendChild(document.createTextNode(s.label));
       lg.appendChild(item);
     });
+  }
+  if (lane.hint) {
+    var hint = div("hint", host);
+    hint.textContent = lane.hint;
   }
   var W = laneWidth(), H = 96, PT = 6, PB = 6;
   var plotW = W - PADL - PADR, plotH = H - PT - PB;
@@ -671,20 +810,22 @@ function nearest(points, t) {
     ? points[a] : points[b];
 }
 
-/* shared x axis */
-function drawXAxis() {
-  var host = document.getElementById("xaxis");
+/* shared x axis, drawn above the state strip and below the lanes */
+function drawXAxis(hostId) {
+  var host = document.getElementById(hostId);
   host.textContent = "";
   var W = laneWidth(), H = 24, plotW = W - PADL - PADR;
   var svg = el("svg", { width: W, height: H }, host);
-  var step = T_END / PERIOD > 6 ? 1 : 0.5;
-  for (var o = 0; o <= T_END / PERIOD + 1e-9; o += step) {
+  var step = orbitStep();
+  var decimals = step >= 1 ? 0 : step >= 0.5 ? 1 : 2;
+  var o0 = Math.ceil(VIEW.t0 / PERIOD / step) * step;
+  for (var o = o0; o * PERIOD <= VIEW.t1 + 1e-9; o += step) {
     var x = xOf(o * PERIOD, plotW);
     if (x > PADL + plotW + 1) break;
     el("line", { x1: x, y1: 0, x2: x, y2: 5, stroke: "var(--axis)",
                  "stroke-width": 1 }, svg);
     var t = el("text", { x: x, y: 17, "text-anchor": "middle" }, svg);
-    t.textContent = o.toFixed(step < 1 ? 1 : 0);
+    t.textContent = o.toFixed(decimals);
   }
   var lbl = el("text", { x: PADL + plotW, y: 17, "text-anchor": "end" }, svg);
   lbl.textContent = "orbits";
@@ -997,18 +1138,49 @@ function drawOrbitView() {
   if (vs.playing) raf = requestAnimationFrame(frame);
 }
 
-/* ---- crosshair + tooltip, shared across every chart ---- */
+/* ---- crosshair + tooltip + drag-to-zoom, shared across every chart ---- */
 var tooltip = document.getElementById("tooltip");
+function setView(t0, t1) {
+  t0 = Math.max(0, t0);
+  t1 = Math.min(T_END, t1);
+  if (t1 - t0 < 30) return;  // don't zoom below half a beacon period
+  VIEW = { t0: t0, t1: t1 };
+  buildAll();
+}
+function resetView() {
+  if (VIEW.t0 === 0 && VIEW.t1 === T_END) return;
+  VIEW = { t0: 0, t1: T_END };
+  buildAll();
+}
 function attachCrosshair(svg, plotW, h, fill) {
   var line = el("line", { y1: 0, y2: h, stroke: "var(--axis)",
                           "stroke-width": 1, visibility: "hidden" }, svg);
   charts.push({ svg: svg, plotW: plotW, line: line });
-  svg.addEventListener("pointermove", function (ev) {
+  var selX0 = null, selRect = null;
+  function pxToT(clientX) {
     var rect = svg.getBoundingClientRect();
-    var t = ((ev.clientX - rect.left) - PADL) / plotW * T_END;
-    if (t < 0 || t > T_END) { hideCross(); return; }
+    return VIEW.t0 + ((clientX - rect.left) - PADL) / plotW * viewSpan();
+  }
+  svg.addEventListener("pointerdown", function (ev) {
+    if (ev.button !== 0) return;
+    selX0 = ev.clientX;
+    svg.setPointerCapture(ev.pointerId);
+  });
+  svg.addEventListener("pointermove", function (ev) {
+    var t = pxToT(ev.clientX);
+    if (selX0 !== null && Math.abs(ev.clientX - selX0) > 6) {
+      if (!selRect) {
+        selRect = el("rect", { y: 0, height: h, fill: "var(--s1)",
+                               opacity: 0.13 }, svg);
+      }
+      var rect = svg.getBoundingClientRect();
+      var a = Math.min(selX0, ev.clientX) - rect.left;
+      selRect.setAttribute("x", a);
+      selRect.setAttribute("width", Math.abs(ev.clientX - selX0));
+    }
+    if (t < VIEW.t0 || t > VIEW.t1) { hideCross(); return; }
     charts.forEach(function (c) {
-      var x = PADL + (t / T_END) * c.plotW;
+      var x = PADL + ((t - VIEW.t0) / viewSpan()) * c.plotW;
       c.line.setAttribute("x1", x); c.line.setAttribute("x2", x);
       c.line.setAttribute("visibility", "visible");
     });
@@ -1017,6 +1189,20 @@ function attachCrosshair(svg, plotW, h, fill) {
     showTooltip(ev, t, rows);
     if (window.__orbitSeek) window.__orbitSeek(t);  // paused globe follows
   });
+  svg.addEventListener("pointerup", function (ev) {
+    var x0 = selX0;
+    selX0 = null;
+    if (selRect) { selRect.remove(); selRect = null; }
+    if (x0 !== null && Math.abs(ev.clientX - x0) > 12) {
+      setView(pxToT(Math.min(x0, ev.clientX)),
+              pxToT(Math.max(x0, ev.clientX)));  // rebuilds every chart
+    }
+  });
+  svg.addEventListener("pointercancel", function () {
+    selX0 = null;
+    if (selRect) { selRect.remove(); selRect = null; }
+  });
+  svg.addEventListener("dblclick", resetView);
   svg.addEventListener("pointerleave", hideCross);
 }
 function hideCross() {
@@ -1026,8 +1212,10 @@ function hideCross() {
 function showTooltip(ev, t, rows) {
   tooltip.textContent = "";
   var head = div("tt-t", tooltip);
-  head.textContent = "orbit " + orbits(t).toFixed(2) + "  ·  t=" +
-                     Math.round(t) + " s";
+  head.textContent = "orbit " + orbits(t).toFixed(2) + " · t=" +
+                     Math.round(t) + " s · " +
+                     (trackOn("eclipse", t) ? "eclipse" : "sunlit") +
+                     (trackOn("ground contact", t) ? " · in contact" : "");
   rows.forEach(function (r) {
     var row = div("row", tooltip);
     var key = document.createElement("span");
@@ -1107,14 +1295,35 @@ themebtn.addEventListener("click", function () {
 });
 
 var lastBuildWidth = 0;
+function updateZoomUI() {
+  var zoomed = VIEW.t0 > 0 || VIEW.t1 < T_END;
+  document.getElementById("zoomreset").hidden = !zoomed;
+  document.getElementById("zinfo").textContent = zoomed
+    ? ("orbit " + orbits(VIEW.t0).toFixed(2) + " – "
+       + orbits(VIEW.t1).toFixed(2) + " of " + orbits(T_END).toFixed(1))
+    : "drag on a chart to zoom";
+}
 function buildAll() {
   charts = [];
   lastBuildWidth = document.getElementById("lanes").clientWidth;
+  // the label gutter breathes with the page: room for "ground contact"
+  // on desktop, graceful truncation on a phone
+  PADL = Math.min(112, Math.max(64, Math.round(lastBuildWidth * 0.15)));
   document.getElementById("lanes").textContent = "";
   drawChips(); drawTiles(); drawOrbitView(); drawTracks(); drawEvents();
-  DATA.lanes.forEach(drawLane);
-  drawXAxis(); drawEventTable();
+  var lastSection = null;
+  DATA.lanes.forEach(function (lane) {
+    if (lane.section && lane.section !== lastSection) {
+      lastSection = lane.section;
+      div("section-head",
+          document.getElementById("lanes")).textContent = lane.section;
+    }
+    drawLane(lane);
+  });
+  drawXAxis("xaxis-top"); drawXAxis("xaxis");
+  drawEventTable(); updateZoomUI();
 }
+document.getElementById("zoomreset").addEventListener("click", resetView);
 var resizeTimer = null;
 window.addEventListener("resize", function () {
   clearTimeout(resizeTimer);

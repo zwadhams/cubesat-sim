@@ -23,6 +23,8 @@ def test_load_flight_extracts_everything(tmp_path):
     lane_titles = [ln["title"] for ln in data["lanes"]]
     assert "State of charge" in lane_titles
     assert "Electrical power" in lane_titles
+    for lane in data["lanes"]:  # every lane teaches: section + one-liner
+        assert lane["section"] and lane["hint"]
     track_labels = [t["label"] for t in data["tracks"]]
     assert "eclipse" in track_labels
     kinds = [e["kind"] for e in data["events"]]

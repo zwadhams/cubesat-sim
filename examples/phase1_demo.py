@@ -8,6 +8,11 @@ Two flights of the same spacecraft:
               via NOMINAL <-> SAFE limit cycling. Nobody programmed a
               duty cycle — it falls out of two hysteresis bands and an
               energy deficit.
+
+Historical note: this was written before Phase 2 added thermal. With the
+battery heater in the energy budget the degraded flight now parks in SAFE
+and is held at ~0.25 SoC by EPS shed/restore flapping instead of limit
+cycling — see phase2_demo.py for the current story.
 """
 
 import json

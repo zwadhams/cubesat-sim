@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from cubesat_sim.kernel.component import Component
 
-NON_ESSENTIAL = ("adcs", "payload")
+NON_ESSENTIAL = ("adcs", "payload", "bat_heater")
 
 # voltage->SoC calibration (matches the battery design values)
 V_EMPTY = 6.0
@@ -32,12 +32,14 @@ class EPS(Component):
         self.load_w = 0.0
         self.soc_est: float | None = None
         self.shedding = False
-        self.desired = {"adcs": True, "payload": False}  # until OBC says otherwise
+        # until the OBC / thermal control say otherwise
+        self.desired = {"adcs": True, "payload": False, "bat_heater": False}
         self._commanded: dict[str, bool] = {}
 
     def on_start(self) -> None:
         self.subscribe("sensors/eps/*")
         self.subscribe("obc/request/loads")
+        self.subscribe("thermal/request/heater")
 
     def step(self, t: float, dt: float) -> None:
         for msg in self.drain():
@@ -49,6 +51,8 @@ class EPS(Component):
                 self.load_w = float(msg.data["watts"])
             elif msg.topic == "obc/request/loads":
                 self.desired.update(msg.data["loads"])
+            elif msg.topic == "thermal/request/heater":
+                self.desired["bat_heater"] = bool(msg.data["on"])
 
         if self.v_meas is None:
             return  # no telemetry yet

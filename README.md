@@ -29,7 +29,7 @@ Rules of the house:
 
 - [x] Phase 0 — kernel: clock, bus, components, RNG, flight recorder
 - [x] Phase 1 — orbit + power (eclipse cycles breathing through the EPS)
-- [ ] Phase 2 — thermal (heater/battery coupling)
+- [x] Phase 2 — thermal (heater/battery coupling, cold-charge inhibit, death spiral)
 - [ ] Phase 3 — ADCS (attitude ↔ solar generation coupling)
 - [ ] Phase 4 — data economy (payload, storage, comms windows)
 - [ ] Phase 5 — FDIR, fault injection, degradation, Monte Carlo harness

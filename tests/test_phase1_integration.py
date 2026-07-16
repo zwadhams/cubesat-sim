@@ -25,20 +25,29 @@ def test_healthy_satellite_breathes_and_stays_nominal():
     assert sim.recorder.events("obc") == []  # no mode changes
 
 
-def test_degraded_array_limit_cycles_between_modes():
+def test_degraded_array_finds_protected_equilibrium():
+    """Pre-thermal, this scenario limit-cycled NOMINAL<->SAFE. With the
+    heater in the energy budget, SAFE-mode margin is ~zero and the flight
+    instead stabilizes at ~0.25 SoC: the OBC parks in SAFE while the EPS
+    shed/restore hysteresis flaps once per orbit, acting as an emergent
+    bang-bang charge regulator."""
     sim = build_sim(dt=5.0, seed=2, illumination=0.45)
     sim.run(duration=12 * orbit_period(sim))
 
     modes = [json.loads(e[4])["to"] for e in sim.recorder.events("obc")]
-    assert modes.count("SAFE") >= 2      # entered SAFE more than once...
-    assert modes.count("NOMINAL") >= 1   # ...and recovered in between: limit cycle
+    assert modes.count("SAFE") >= 1  # protection engaged
 
     payload_cmds = sim.recorder.messages(topic="cmd/loads/payload")
     states = [json.loads(row[5])["on"] for row in payload_cmds]
     assert True in states and False in states
 
+    eps_kinds = [e[3] for e in sim.recorder.events("eps")]
+    assert "load_shed" in eps_kinds and "load_restore" in eps_kinds
+
     soc = [v for *_, v in sim.recorder.telemetry("physics", "soc_true")]
     assert min(soc) > 0.05  # struggles but survives
+    last_quarter = soc[-len(soc) // 4:]
+    assert 0.1 < min(last_quarter) and max(last_quarter) < 0.4  # settled band
     kinds = [e[3] for e in sim.recorder.events("physics")]
     assert "brownout" not in kinds
 

@@ -14,6 +14,13 @@ Cross-couplings that make life interesting:
   powered — shed the ADCS and the satellite starts to drift;
 - lithium-ion cells must not charge below 0 C (blocked charge power dumps
   as heat into the structure).
+
+Faults are ground truth too: `fault/*` messages (from the FaultInjector)
+latch sensors, flip bits in sensor words, step wheel-bearing friction, and
+scar the solar array. A *soft* sensor latch-up clears when the ADCS rail
+power-cycles (off -> on); *hard* faults are forever. Degradation (battery
+fade, array darkening, friction growth) runs continuously inside the
+component models themselves.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from cubesat_sim.environment.groundstation import GroundSite
 from cubesat_sim.environment.magfield import dipole_field_eci
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.environment.sun import sun_direction_eci
+from cubesat_sim.faults import seu_upset
 from cubesat_sim.kernel.component import Component
 from cubesat_sim.physics.attitude import AttitudeDynamics
 from cubesat_sim.physics.power import Battery, SolarArray
@@ -89,12 +97,39 @@ class SpacecraftPhysics(Component):
         self._prev_eclipse: bool | None = None
         self._brownout = False
         self._charge_blocked = False
+        self._stuck: dict[str, str] = {}          # sensor -> "soft" | "hard"
+        self._stuck_vals: dict[str, tuple] = {}   # latched output words
+        self._seu_pending: list[str] = []         # sensors owed a bit flip
 
     def on_start(self) -> None:
         self.subscribe("cmd/loads/*")
         self.subscribe("cmd/adcs/*")
         self.subscribe("radio/tx")   # spacecraft transmitter into the channel
         self.subscribe("ground/tx")  # ground transmitter into the channel
+        self.subscribe("fault/*")    # injected hardware faults are truth
+
+    def _clear_soft_latchups(self) -> None:
+        """An ADCS rail power cycle clears latched (soft-stuck) sensors."""
+        for sensor, kind in list(self._stuck.items()):
+            if kind == "soft":
+                del self._stuck[sensor]
+                self._stuck_vals.pop(sensor, None)
+                self.event("latchup_cleared", sensor=sensor)
+
+    def _sensor_out(self, sensor: str, values: tuple) -> tuple:
+        """Apply latched-stuck and pending-SEU faults to a sensor reading."""
+        if sensor in self._stuck:
+            values = self._stuck_vals.setdefault(sensor, values)
+        if sensor in self._seu_pending:
+            self._seu_pending.remove(sensor)
+            vals = list(values)
+            # the sun sensor's valid flag is not a corruptible float word
+            n_words = 3 if sensor == "sun" else len(vals)
+            idx = int(self.rng.integers(n_words))
+            vals[idx] = seu_upset(float(vals[idx]), self.rng)
+            self.event("seu_corruption", sensor=sensor)
+            values = tuple(vals)
+        return values
 
     def _init_run_state(self) -> None:
         """Seed-dependent initial conditions, drawn once on the first step."""
@@ -114,7 +149,23 @@ class SpacecraftPhysics(Component):
             if msg.topic.startswith("cmd/loads/"):
                 name = msg.topic.rsplit("/", 1)[-1]
                 if name in self.loads and name not in ESSENTIAL_LOADS:
-                    self.switches[name] = bool(msg.data.get("on"))
+                    on = bool(msg.data.get("on"))
+                    if name == "adcs" and on and not self.switches["adcs"]:
+                        self._clear_soft_latchups()
+                    self.switches[name] = on
+            elif msg.topic == "fault/sensor_stuck":
+                sensor = msg.data["sensor"]
+                if msg.data.get("stuck", True):
+                    self._stuck[sensor] = "hard" if msg.data.get("hard") else "soft"
+                else:
+                    self._stuck.pop(sensor, None)
+                    self._stuck_vals.pop(sensor, None)
+            elif msg.topic == "fault/seu":
+                self._seu_pending.append(msg.data["sensor"])
+            elif msg.topic == "fault/wheel_friction":
+                self.attitude.p.wheel_friction_nm_per_nms = float(msg.data["nm_per_nms"])
+            elif msg.topic == "fault/array_hit":
+                self.array.illumination *= float(msg.data["mult"])
             elif msg.topic == "cmd/adcs/wheel_torque":
                 self._wheel_tau_cmd = np.array(
                     [msg.data["x"], msg.data["y"], msg.data["z"]], dtype=float)
@@ -217,6 +268,7 @@ class SpacecraftPhysics(Component):
 
         if not charge_blocked:
             self.battery.integrate(p_net, dt)
+        self.array.age(dt, in_sun=not eclipse)
 
         if self.battery.soc <= 0.0 and not self._brownout:
             self._brownout = True
@@ -228,10 +280,13 @@ class SpacecraftPhysics(Component):
         elif self._brownout and self.battery.soc > 0.05:
             self._brownout = False
 
-        # noisy sensor readings — all any subsystem ever gets to see
+        # noisy sensor readings — all any subsystem ever gets to see.
+        # each reading passes through _sensor_out, where latched-stuck and
+        # SEU faults corrupt the output word
         v_true = self.battery.voltage(0.0 if charge_blocked else p_net)
-        self.publish("sensors/eps/battery_voltage",
-                     volts=v_true + float(self.rng.normal(0.0, 0.02)))
+        (v_out,) = self._sensor_out(
+            "battery_voltage", (v_true + float(self.rng.normal(0.0, 0.02)),))
+        self.publish("sensors/eps/battery_voltage", volts=v_out)
         self.publish("sensors/eps/solar_power",
                      watts=max(0.0, p_gen + float(self.rng.normal(0.0, 0.05))))
         self.publish("sensors/eps/load_power",
@@ -242,18 +297,21 @@ class SpacecraftPhysics(Component):
                      kelvin=self.thermal.structure.temp_k + float(self.rng.normal(0.0, 0.3)))
 
         gyro = att.omega + self._gyro_bias + self.rng.normal(0.0, np.deg2rad(0.01), 3)
-        self.publish("sensors/adcs/gyro",
-                     x=float(gyro[0]), y=float(gyro[1]), z=float(gyro[2]))
+        gx, gy, gz = self._sensor_out(
+            "gyro", (float(gyro[0]), float(gyro[1]), float(gyro[2])))
+        self.publish("sensors/adcs/gyro", x=gx, y=gy, z=gz)
         mag = b_body + self.rng.normal(0.0, 1.0e-7, 3)
-        self.publish("sensors/adcs/mag",
-                     x=float(mag[0]), y=float(mag[1]), z=float(mag[2]))
+        mx, my, mz = self._sensor_out(
+            "mag", (float(mag[0]), float(mag[1]), float(mag[2])))
+        self.publish("sensors/adcs/mag", x=mx, y=my, z=mz)
         sun_body = att.body_from_eci(sun_hat) + self.rng.normal(0.0, 0.017, 3)
         if eclipse:
-            self.publish("sensors/adcs/sun", x=0.0, y=0.0, z=0.0, valid=False)
+            sun_raw = (0.0, 0.0, 0.0, False)
         else:
-            self.publish("sensors/adcs/sun",
-                         x=float(sun_body[0]), y=float(sun_body[1]),
-                         z=float(sun_body[2]), valid=True)
+            sun_raw = (float(sun_body[0]), float(sun_body[1]),
+                       float(sun_body[2]), True)
+        sx, sy, sz, sv = self._sensor_out("sun", sun_raw)
+        self.publish("sensors/adcs/sun", x=sx, y=sy, z=sz, valid=bool(sv))
         h = att.h_wheel
         self.publish("sensors/adcs/wheel_momentum",
                      x=float(h[0]), y=float(h[1]), z=float(h[2]))
@@ -279,3 +337,5 @@ class SpacecraftPhysics(Component):
             self.record("gs_contact", float(contact))
             self.record("target_visible", float(target_visible))
             self.record("tx_w", tx_w)
+            self.record("batt_capacity_wh", self.battery.capacity_wh)
+            self.record("array_illum", self.array.illumination)

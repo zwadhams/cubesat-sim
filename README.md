@@ -27,6 +27,20 @@ falls out.
   equivalence test requires the C OBC to fly bit-identically to the Python
   reference implementation.
 
+- **Faults & degradation** (`cubesat_sim.faults`) — a `FaultInjector`
+  publishes `fault/*` messages that physics honors: latched (stuck)
+  sensors, SEU bit flips (Poisson, rate multiplied over the South Atlantic
+  Anomaly), wheel-bearing friction steps, solar-array strikes. Soft
+  latch-ups clear when the ADCS rail power-cycles; hard faults are
+  forever. Battery fade, array darkening, and bearing wear run
+  continuously at realistic rates. The OBC carries FDIR: a gyro health
+  watchdog (exact-repeat and out-of-range detection) that responds with
+  ADCS power cycles on a three-attempt budget, then gives up loudly.
+- **Monte Carlo** (`cubesat_sim.montecarlo`) — `sweep(seeds)` flies
+  parallel campaigns with seed-deterministic random misfortunes, keeps
+  every flight recording for replay, and classifies outcomes
+  (NOMINAL/SAFE/SHED/FDIR_GIVEUP/BROWNED_OUT/DEAD/CRASHED).
+
 Rules of the house:
 
 1. Ground truth lives in the physics layer; everything else sees noisy sensors.
@@ -45,7 +59,12 @@ Rules of the house:
       bounded downlink queue, RF channel with contact windows and packet
       loss, ground station whose operator rule closes a control loop
       through space (telemetry down -> decision -> command up)
-- [ ] Phase 5 — FDIR, fault injection, degradation, Monte Carlo harness
+- [x] Phase 5 — FDIR (gyro watchdog + ADCS power-cycle recovery, in both
+      OBC implementations), fault injection engine (stuck sensors, SEU
+      bit flips peaking over the South Atlantic Anomaly, bearing wear,
+      debris strikes), continuous degradation (battery fade, array
+      darkening), and a Monte Carlo campaign harness
+- [ ] Phase 6 (stretch) — real protocols, second satellite, dashboard
 
 ## Getting started
 
@@ -56,7 +75,7 @@ make -C c/obc                                  # C flight software (OBC)
 make -C cpp/comms                              # C++ flight software (comms)
 cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
-.venv/bin/python examples/phase4_demo.py
+.venv/bin/python examples/phase5_demo.py
 ```
 
 To fly with the C OBC instead of the Python reference:

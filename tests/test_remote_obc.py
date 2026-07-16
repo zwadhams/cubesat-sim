@@ -6,10 +6,10 @@ from cubesat_sim.mission import build_sim
 pytestmark = pytest.mark.usefixtures("rust_adcs_binary", "cpp_comms_binary")
 
 
-def flight(obc_impl, **cfg):
+def flight(obc_impl, orbits=6, **cfg):
     sim = build_sim(dt=5.0, seed=11, obc_impl=obc_impl, **cfg)
     period = sim.components[0].orbit.period_s
-    sim.run(duration=6 * period)
+    sim.run(duration=orbits * period)
     data = (
         sim.recorder.messages(),
         sim.recorder.telemetry("obc"),
@@ -26,6 +26,18 @@ def test_c_obc_bit_identical_to_python_reference(c_obc_binary):
     C/Python divide. Uses the degraded scenario so mode changes and load
     requests actually exercise the logic."""
     assert flight("python", illumination=0.45) == flight("c", illumination=0.45)
+
+
+def test_c_obc_fdir_bit_identical_to_python_reference(c_obc_binary):
+    """Same bar for the FDIR paths: a soft stuck gyro (detect, cycle,
+    recover) followed by a hard one (three cycles, give up) must produce
+    identical flights from both implementations."""
+    from cubesat_sim.faults import sensor_stuck
+
+    faults = [sensor_stuck(600.0, "gyro"),
+              sensor_stuck(9000.0, "gyro", hard=True)]
+    assert flight("python", orbits=3, faults=faults) == \
+           flight("c", orbits=3, faults=faults)
 
 
 def test_c_obc_flies_healthy_scenario(c_obc_binary):

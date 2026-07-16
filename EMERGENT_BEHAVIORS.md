@@ -119,7 +119,51 @@ Template:
   orbits. Under Phase 2 physics this same scenario self-stabilized
   (entry 2); adding one coupling turned the EPS's protective reflex into a
   terminal decision. Passivity is not safety.
-- status: kept — flagship Phase 3 finding. A future FDIR rule (Phase 5)
+- status: kept — flagship Phase 3 finding. A future FDIR rule
   might notice "shed ADCS + facing < 0 + SoC falling" and gamble on
   re-powering the ADCS; whether that rule makes things better or worse is
-  exactly the kind of question this simulator is for.
+  exactly the kind of question this simulator is for. (Deliberately
+  deferred out of Phase 5 scope, 2026-07-16 — to be revisited.)
+
+## 7. FDIR giveup cascade: an informational fault becomes an electrical death
+- first observed: Phase 5 (FDIR + fault injection)
+- reproduce: `build_sim(dt=1.0, seed=42,
+  faults=[sensor_stuck(2500.0, "gyro", hard=True)])`, 4+ orbits
+  (`examples/phase5_demo.py` hard_failure scenario)
+- mechanism: a *hard* gyro latch-up defeats the OBC's power-cycle recovery:
+  FDIR correctly detects the frozen output word, burns its three-cycle
+  budget in ~90 s, and gives up (by design — do no harm, leave the ADCS
+  powered). The ADCS then flies on a rate word frozen near zero: the PD
+  damping term goes useless, pointing wobbles (sun facing swings ~±0.6
+  instead of holding ~0.95), and average generation quietly erodes by
+  tens of percent. Nothing is "failing" — every subsystem is green except
+  one sensor — but the energy budget now runs a structural deficit: the
+  OBC oscillates SAFE/NOMINAL from orbit ~1.8, and at orbit ~3.3 the EPS
+  hard-shed fires and latches (entry 6's one-way door, now entered through
+  a *sensor* fault instead of a degraded array). True SoC flatlines at
+  ~0.22 with the payload and ADCS dead. The failure was informational;
+  the death was electrical; the coupling was attitude.
+- status: kept — flagship Phase 5 finding. The FDIR did everything right
+  at its own layer; no rule in the system connects "gyro unrecoverable"
+  to "expect a power deficit soon." Cross-layer fault propagation is
+  exactly what a mag-based rate estimate fallback (or entry 6's deferred
+  re-power gamble) would have to address.
+
+## 8. The watchdog's blind spot: stuck mag is invisible by design
+- first observed: Phase 5 Monte Carlo sweep (16 seeds x 8 orbits,
+  `examples/phase5_demo.py`)
+- reproduce: any campaign flight whose stuck sensor is the magnetometer
+  (e.g. `run_flight(6)`: two mag latch-ups, `fdir_cycles == 0`)
+- mechanism: the OBC watchdog monitors only the gyro, so a latched
+  magnetometer sails through untouched — visible in the Monte Carlo table
+  as `sensor_stuck` faults with zero FDIR cycles. Consequences are mode-
+  dependent: in sun-point the mag only steers desaturation (mild); in
+  detumble B-dot differentiates the mag signal, and a frozen B reads as
+  "field derivative zero," silently disabling detumble authority. A
+  satellite that happens to be tumbling when the mag latches cannot
+  detumble and nothing on board notices.
+- status: kept — an honest reflection of the FDIR coverage actually built
+  (real FDIR suites have exactly these coverage gaps). The Monte Carlo
+  table makes the gap measurable rather than hypothetical; extending the
+  watchdog pattern to the mag is straightforward if a future phase wants
+  the comparison flight.

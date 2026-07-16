@@ -49,6 +49,11 @@ class AttitudeParams:
     residual_dipole_am2: np.ndarray = field(
         default_factory=lambda: np.array([0.002, 0.0, 0.001]))  # build residual
     dist_torque_std_nm: float = 2.0e-7  # unmodeled disturbance noise
+    # bearing drag: tau_on_wheel = -k * h_wheel, reaction torques the body,
+    # so momentum leaks from the wheels into the body (total conserved).
+    # Grows with lubricant degradation; fault injection can step it.
+    wheel_friction_nm_per_nms: float = 0.0
+    wheel_friction_growth_per_s: float = 0.0
 
 
 class AttitudeDynamics:
@@ -76,6 +81,9 @@ class AttitudeDynamics:
         mtq_m_cmd: np.ndarray,
         b_body: np.ndarray,
     ) -> None:
+        if self.p.wheel_friction_growth_per_s > 0.0:
+            self.p.wheel_friction_nm_per_nms += self.p.wheel_friction_growth_per_s * dt
+
         # RK4 substeps capped at 2.5 s: explicit Euler slowly pumps energy
         # into free tumbling (it blew up an uncontrolled satellite after
         # ~18 simulated hours); RK4 is slightly dissipative and holds for days
@@ -104,15 +112,20 @@ class AttitudeDynamics:
         tau_w = np.where(saturating, 0.0, tau_w)
 
         m_mtq = np.clip(mtq_m_cmd, -p.mtq_m_max_am2, p.mtq_m_max_am2)
-        tau_body = tau_ext_body + np.cross(m_mtq, b_body) + tau_w
+        h_wheel = self.h_wheel
+        # bearing drag transfers momentum wheel -> body; held constant over
+        # the substep (k*h barely changes in 2.5 s), which keeps the exchange
+        # exactly momentum-conserving: body gains what the wheel loses
+        tau_fric = p.wheel_friction_nm_per_nms * h_wheel
+        tau_from_wheel = tau_w + tau_fric
+        tau_body = tau_ext_body + np.cross(m_mtq, b_body) + tau_from_wheel
 
         # RK4 on (q, omega); torques held constant over the substep, wheel
-        # momentum ramps linearly (dh/dt = -tau_w), which each stage sees at
+        # momentum ramps linearly (dh/dt = -tau), which each stage sees at
         # its own stage time — keeps momentum exchange 4th-order consistent
-        h_wheel = self.h_wheel
 
         def deriv(q, omega, stage_t):
-            h_total = inertia * omega + h_wheel - tau_w * stage_t
+            h_total = inertia * omega + h_wheel - tau_from_wheel * stage_t
             omega_dot = (tau_body - np.cross(omega, h_total)) / inertia
             return quat_derivative(q, omega), omega_dot
 
@@ -125,7 +138,7 @@ class AttitudeDynamics:
         self.q = self.q / np.linalg.norm(self.q)
         self.omega = w0 + dt / 6.0 * (k1w + 2 * k2w + 2 * k3w + k4w)
 
-        self.h_wheel = np.clip(h_wheel - tau_w * dt,
+        self.h_wheel = np.clip(h_wheel - tau_from_wheel * dt,
                                -p.wheel_h_max_nms, p.wheel_h_max_nms)
 
     def angular_momentum_eci(self) -> np.ndarray:

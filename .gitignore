@@ -7,3 +7,4 @@ runs/
 c/obc/obc
 cpp/comms/comms
 rust/adcs/target/
+c/eps/eps

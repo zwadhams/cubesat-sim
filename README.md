@@ -19,13 +19,13 @@ falls out.
   They perceive the world only through sensors, act only through actuators,
   and talk only over the bus.
 - **Polyglot flight software** — subsystems are written in the language
-  their real-world counterpart would be: OBC in C (cFS heritage), ADCS in
-  Rust, comms in C++, EPS bare-metal-style C (planned), payload controller
-  and ground segment in Python. Compiled
-  subsystems run as separate OS processes behind `RemoteComponent`, a
-  lockstep NDJSON stdin/stdout bridge that preserves determinism — the
-  equivalence test requires the C OBC to fly bit-identically to the Python
-  reference implementation.
+  their real-world counterpart would be: OBC in C (cFS heritage), EPS in
+  bare-metal-style C (static buffers, no heap — PDU firmware), ADCS in
+  Rust, comms in C++, payload controller and ground segment in Python.
+  Compiled subsystems run as separate OS processes behind
+  `RemoteComponent`, a lockstep NDJSON stdin/stdout bridge that preserves
+  determinism — equivalence tests require the C OBC and C EPS to fly
+  bit-identically to their Python reference implementations.
 
 - **Faults & degradation** (`cubesat_sim.faults`) — a `FaultInjector`
   publishes `fault/*` messages that physics honors: latched (stuck)
@@ -91,6 +91,8 @@ Rules of the house:
       bit error rate, FARM-style command ARQ, and the linkdump analyzer
       (MQTT-style live transport deliberately avoided to keep
       byte-identical replay)
+- [x] Phase 6b' — EPS ported to bare-metal-style C (bit-identical to the
+      Python reference; the polyglot flight-computer map is complete)
 - [ ] Phase 6c — second satellite (deferred until the single-sat setup is
       thoroughly explored)
 
@@ -100,6 +102,7 @@ Rules of the house:
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 make -C c/obc                                  # C flight software (OBC)
+make -C c/eps                                  # C flight software (EPS)
 make -C cpp/comms                              # C++ flight software (comms)
 cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
@@ -108,7 +111,7 @@ cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/python -m cubesat_sim.linkdump runs/phase6_link.db    # decode the link
 ```
 
-To fly with the C OBC instead of the Python reference:
-`build_sim(obc_impl="c")`. Observed emergent behaviors are cataloged in
+To fly with the C flight software instead of the Python references:
+`build_sim(obc_impl="c", eps_impl="c")`. Observed emergent behaviors are cataloged in
 [EMERGENT_BEHAVIORS.md](EMERGENT_BEHAVIORS.md) — the policy is to keep and
 document them unless they break simulation integrity.

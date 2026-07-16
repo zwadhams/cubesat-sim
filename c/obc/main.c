@@ -23,6 +23,7 @@
 
 #define _POSIX_C_SOURCE 200809L  /* getline */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,18 @@ static const int STUCK_TRIGGER = 5;
 static const int INSANE_TRIGGER = 3;
 static const double CYCLE_OFF_S = 20.0;
 static const int MAX_CYCLES = 3;
+
+/* Format a double the way the bridge expects: an integral value prints
+ * with a decimal point ("1.0", never "1") so it JSON-parses as a float,
+ * matching the Python reference's repr — soc_est clamps to exactly 1.0
+ * at full charge, so this case is live, not theoretical. */
+static int fmt_num(char *dst, size_t cap, double v)
+{
+    if (fabs(v) < 1e15 && v == (double)(long long)v) {
+        return snprintf(dst, cap, "%.1f", v);
+    }
+    return snprintf(dst, cap, "%.17g", v);
+}
 
 /* Parse the number after the first occurrence of `key`, at or after `start`. */
 static int find_double_at(const char *start, const char *key, double *out)
@@ -155,9 +168,11 @@ int main(void)
         }
         const char *mode_str = (mode == MODE_SAFE) ? "SAFE" : "NOMINAL";
         if (changed) {
+            char soc_text[32];
+            (void)fmt_num(soc_text, sizeof soc_text, soc_est);
             evn += (size_t)snprintf(ev + evn, sizeof ev - evn,
                 "{\"kind\":\"mode_change\",\"detail\":"
-                "{\"to\":\"%s\",\"soc_est\":%.17g}}", mode_str, soc_est);
+                "{\"to\":\"%s\",\"soc_est\":%s}}", mode_str, soc_text);
         }
 
         /* -- FDIR: gyro health watchdog -> ADCS power cycle -------------- */

@@ -21,6 +21,7 @@ from cubesat_sim.subsystems.thermal_ctrl import ThermalControl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 C_OBC_BIN = REPO_ROOT / "c" / "obc" / "obc"
+C_EPS_BIN = REPO_ROOT / "c" / "eps" / "eps"
 RUST_ADCS_BIN = REPO_ROOT / "rust" / "adcs" / "target" / "release" / "adcs"
 CPP_COMMS_BIN = REPO_ROOT / "cpp" / "comms" / "comms"
 
@@ -43,6 +44,7 @@ def build_sim(
     faults: tuple[ScheduledFault, ...] | list[ScheduledFault] = (),
     seu_rate_per_day: float = 0.0,
     obc_impl: str = "python",
+    eps_impl: str = "python",
     adcs_impl: str = "rust",
     comms_impl: str = "cpp",
 ) -> Simulation:
@@ -72,7 +74,12 @@ def build_sim(
         )),
         initial_tumble_dps=initial_tumble_dps,
     ))
-    sim.add(EPS())
+    if eps_impl == "python":
+        sim.add(EPS())
+    elif eps_impl == "c":
+        sim.add(RemoteComponent("eps", period=1.0, argv=[str(C_EPS_BIN)]))
+    else:
+        raise ValueError(f"unknown eps_impl: {eps_impl!r}")
     if obc_impl == "python":
         sim.add(OBC())
     elif obc_impl == "c":

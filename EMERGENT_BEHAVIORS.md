@@ -133,21 +133,31 @@ Template:
 - mechanism: a *hard* gyro latch-up defeats the OBC's power-cycle recovery:
   FDIR correctly detects the frozen output word, burns its three-cycle
   budget in ~90 s, and gives up (by design — do no harm, leave the ADCS
-  powered). The ADCS then flies on a rate word frozen near zero: the PD
-  damping term goes useless, pointing wobbles (sun facing swings ~±0.6
-  instead of holding ~0.95), and average generation quietly erodes by
-  tens of percent. Nothing is "failing" — every subsystem is green except
-  one sensor — but the energy budget now runs a structural deficit: the
-  OBC oscillates SAFE/NOMINAL from orbit ~1.8, and at orbit ~3.3 the EPS
-  hard-shed fires and latches (entry 6's one-way door, now entered through
-  a *sensor* fault instead of a degraded array). True SoC flatlines at
-  ~0.22 with the payload and ADCS dead. The failure was informational;
-  the death was electrical; the coupling was attitude.
-- status: kept — flagship Phase 5 finding. The FDIR did everything right
-  at its own layer; no rule in the system connects "gyro unrecoverable"
-  to "expect a power deficit soon." Cross-layer fault propagation is
-  exactly what a mag-based rate estimate fallback (or entry 6's deferred
-  re-power gamble) would have to address.
+  powered). The lethal detail is *what value* the sensor froze at: the
+  fault landed mid-detumble, latching the rate word at 0.599 deg/s —
+  0.1 deg/s **above** the ADCS's 0.5 deg/s detumble-exit gate. The mode
+  logic compares that threshold against a dead sensor forever, so
+  SUN_POINT never engages for the rest of the mission (the recording
+  shows `mode_sun_point` flat at 0; the soft-fault twin flight crosses
+  the gate at t=2688 after recovery and averages 5.4 W — the hard-fault
+  flight averages 2.1 W on incidental attitude alone). Nothing is
+  "failing" — every subsystem is green except one sensor — but the
+  energy budget now runs a structural deficit: the OBC oscillates
+  SAFE/NOMINAL from orbit ~1.8, and at orbit ~3.3 the EPS hard-shed
+  fires and latches (entry 6's one-way door, entered through a *sensor*
+  fault instead of a degraded array). True SoC flatlines at ~0.22 with
+  the payload and ADCS dead. The failure was informational; the death
+  was electrical; the coupling was a mode gate.
+- status: kept — flagship Phase 5 finding, and a direct sequel to entry
+  4's mechanism class (mode logic latching a wrong state off bad sensor
+  data — which entry 4 explicitly flagged as one to watch for under
+  fault injection). First written up with the wrong mechanism ("PD flying
+  with a dead damping term"); the Phase 6 dashboard exposed the truth
+  within minutes of first rendering this flight — the missing sun-point
+  track was visible at a glance. No rule on board connects "gyro
+  unrecoverable" to "expect a power deficit"; a mag-based rate-estimate
+  fallback (or entry 6's deferred re-power gamble) is what a fix would
+  look like.
 
 ## 8. The watchdog's blind spot: stuck mag is invisible by design
 - first observed: Phase 5 Monte Carlo sweep (16 seeds x 8 orbits,

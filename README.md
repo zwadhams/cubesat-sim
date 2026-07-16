@@ -40,6 +40,13 @@ falls out.
   parallel campaigns with seed-deterministic random misfortunes, keeps
   every flight recording for replay, and classifies outcomes
   (NOMINAL/SAFE/SHED/FDIR_GIVEUP/BROWNED_OUT/DEAD/CRASHED).
+- **Flight reports** (`cubesat_sim.dashboard`) — renders any flight
+  recording into a single self-contained HTML file (no server, no
+  dependencies): stat tiles, a digital state strip (eclipse, contact,
+  safe mode, shedding, ...), an event timeline with severity glyphs,
+  and telemetry lanes with a shared crosshair, eclipse shading, and
+  table views. Its first render caught a wrong mechanism claim in
+  catalog entry 7.
 
 Rules of the house:
 
@@ -64,7 +71,12 @@ Rules of the house:
       bit flips peaking over the South Atlantic Anomaly, bearing wear,
       debris strikes), continuous degradation (battery fade, array
       darkening), and a Monte Carlo campaign harness
-- [ ] Phase 6 (stretch) — real protocols, second satellite, dashboard
+- [x] Phase 6a — flight report dashboard (recording -> self-contained HTML)
+- [ ] Phase 6b — network comms realism (CCSDS-style framing; noted as a
+      priority — MQTT-style live transport deliberately avoided to keep
+      byte-identical replay)
+- [ ] Phase 6c — second satellite (deferred until the single-sat setup is
+      thoroughly explored)
 
 ## Getting started
 
@@ -76,6 +88,7 @@ make -C cpp/comms                              # C++ flight software (comms)
 cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
 .venv/bin/python examples/phase5_demo.py
+.venv/bin/python -m cubesat_sim.dashboard runs/phase5_hard_failure.db  # -> .html
 ```
 
 To fly with the C OBC instead of the Python reference:

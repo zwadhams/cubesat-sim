@@ -79,6 +79,9 @@ class Component:
     def on_start(self) -> None:
         """Called once when added to the simulation. Subscribe here."""
 
+    def on_stop(self) -> None:
+        """Called by Simulation.close(). Release external resources here."""
+
     def step(self, t: float, dt: float) -> None:
         """Called every `period` simulated seconds. `t` is current sim time,
         `dt` the time elapsed since this component's previous step."""

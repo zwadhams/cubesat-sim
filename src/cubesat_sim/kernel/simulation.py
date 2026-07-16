@@ -62,4 +62,6 @@ class Simulation:
         self.recorder.flush()
 
     def close(self) -> None:
+        for comp in self.components:
+            comp.on_stop()
         self.recorder.close()

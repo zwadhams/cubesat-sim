@@ -454,6 +454,7 @@ var SEV = { critical: "var(--critical)", warning: "var(--warning)",
             good: "var(--good)", neutral: "var(--muted)" };
 var NS = "http://www.w3.org/2000/svg";
 var charts = [];   // {svg, plotW, update(tOrNull)}
+var orbitUI = null;  // orbit view state; survives chart rebuilds
 
 function el(name, attrs, parent) {
   var n = document.createElementNS(NS, name);
@@ -725,7 +726,6 @@ function drawOrbitView() {
     o.value = v; o.textContent = v + "×";
     speedSel.appendChild(o);
   });
-  speedSel.value = "300";
   var range = document.createElement("input");
   range.type = "range"; range.min = 0; range.max = T_END;
   range.step = Math.max(1, T_END / 2000); bar.appendChild(range);
@@ -734,18 +734,27 @@ function drawOrbitView() {
 
   var reduced = window.matchMedia &&
       matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var yaw = -0.9, pitch = 0.38, oT = 0, playing = !reduced, last = null,
-      raf = null;
+  // view state lives outside this function so a rebuild (resize, mobile
+  // URL-bar show/hide) never snaps the globe back to its default pose
+  // or restarts the clock
+  if (!orbitUI) {
+    orbitUI = { yaw: -0.9, pitch: 0.38, oT: 0, playing: !reduced,
+                speed: "300" };
+  }
+  var vs = orbitUI;
+  var last = null, raf = null;
   var cx = W / 2, cy = H / 2;
   var s = (Math.min(W, H) / 2 - 8) / 1.32;
   var PERIOD_O = 2 * Math.PI / O.n_rad_s;
 
+  speedSel.value = vs.speed;
+
   /* view: Rz(yaw) then Rx(pitch); screen x right, ECI north up,
      depth d > 0 faces the viewer */
   function rot(v) {
-    var c = Math.cos(yaw), sn = Math.sin(yaw);
+    var c = Math.cos(vs.yaw), sn = Math.sin(vs.yaw);
     var x = v[0] * c - v[1] * sn, y = v[0] * sn + v[1] * c, z = v[2];
-    var cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var cp = Math.cos(vs.pitch), sp = Math.sin(vs.pitch);
     return [x, y * cp - z * sp, y * sp + z * cp];
   }
   function P(v) {
@@ -796,7 +805,7 @@ function drawOrbitView() {
         s2 = css("--s2"), s3 = css("--s3"), s4 = css("--s4"),
         serious = css("--serious"), ink2 = css("--ink-2"),
         surface = css("--surface");
-    var gmst = O.gmst0_rad + O.w_earth_rad_s * oT;
+    var gmst = O.gmst0_rad + O.w_earth_rad_s * vs.oT;
     var lonOff = gmst * 180 / Math.PI;
     function earthPt(lat, lon) { return P(latLon(lat, lon + lonOff)); }
 
@@ -853,7 +862,7 @@ function drawOrbitView() {
     }
 
     // orbit ring: dim behind the globe, faded in eclipse
-    var t0ring = Math.floor(oT / PERIOD_O) * PERIOD_O;
+    var t0ring = Math.floor(vs.oT / PERIOD_O) * PERIOD_O;
     ctx.lineWidth = 2;
     for (var i = 0; i < 180; i++) {
       var ta = t0ring + (i / 180) * PERIOD_O,
@@ -870,7 +879,7 @@ function drawOrbitView() {
 
     // ground sites ride the rotation
     O.sites.forEach(function (site) {
-      var p = P(siteEci(site.lat, site.lon, oT));
+      var p = P(siteEci(site.lat, site.lon, vs.oT));
       if (p.d <= 0) return;
       var stn = site.kind === "station";
       ctx.beginPath();
@@ -882,11 +891,12 @@ function drawOrbitView() {
     });
 
     // trail, then the satellite itself
-    var sp = P(satPos(oT));
+    var sp = P(satPos(vs.oT));
     ctx.lineWidth = 2; ctx.strokeStyle = s1;
-    var TRAIL = Math.min(oT, PERIOD_O * 0.22);
+    var TRAIL = Math.min(vs.oT, PERIOD_O * 0.22);
     for (var j = 0; j < 24; j++) {
-      var u0 = oT - TRAIL * (1 - j / 24), u1 = oT - TRAIL * (1 - (j + 1) / 24);
+      var u0 = vs.oT - TRAIL * (1 - j / 24),
+          u1 = vs.oT - TRAIL * (1 - (j + 1) / 24);
       var qa = P(satPos(u0)), qb = P(satPos(u1));
       if (occluded(qa) || occluded(qb)) continue;
       ctx.globalAlpha = 0.06 + 0.5 * (j / 24);
@@ -894,8 +904,8 @@ function drawOrbitView() {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    if (trackOn("ground contact", oT)) {
-      var st = O.sites[0], gp = P(siteEci(st.lat, st.lon, oT));
+    if (trackOn("ground contact", vs.oT)) {
+      var stn = O.sites[0], gp = P(siteEci(stn.lat, stn.lon, vs.oT));
       ctx.strokeStyle = s2; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
       ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(sp.x, sp.y);
       ctx.stroke(); ctx.globalAlpha = 1;
@@ -920,37 +930,39 @@ function drawOrbitView() {
     }
     ctx.globalAlpha = 1;
 
-    orbChip.textContent = "orbit " + (oT / PERIOD_O).toFixed(2);
-    eclChip.textContent = trackOn("eclipse", oT) ? "eclipse" : "sunlit";
-    eclChip.className = "chip" + (trackOn("eclipse", oT) ? "" : " on");
-    conChip.textContent = trackOn("ground contact", oT)
+    orbChip.textContent = "orbit " + (vs.oT / PERIOD_O).toFixed(2);
+    eclChip.textContent = trackOn("eclipse", vs.oT) ? "eclipse" : "sunlit";
+    eclChip.className = "chip" + (trackOn("eclipse", vs.oT) ? "" : " on");
+    conChip.textContent = trackOn("ground contact", vs.oT)
       ? "in contact" : "no contact";
-    conChip.className = "chip" + (trackOn("ground contact", oT) ? " on" : "");
+    conChip.className = "chip" + (trackOn("ground contact", vs.oT) ? " on" : "");
   }
 
   function frame(ts) {
     raf = null;
     if (last === null) last = ts;
     var dt = (ts - last) / 1000; last = ts;
-    if (playing) {
-      oT += dt * parseFloat(speedSel.value);
-      if (oT > T_END) oT = 0;
-      range.value = oT;
+    if (vs.playing) {
+      vs.oT += dt * parseFloat(speedSel.value);
+      if (vs.oT > T_END) vs.oT = 0;
+      range.value = vs.oT;
     }
     render();
-    if (playing) raf = requestAnimationFrame(frame);
+    if (vs.playing) raf = requestAnimationFrame(frame);
   }
   function setPlaying(on) {
-    playing = on; last = null;
+    vs.playing = on; last = null;
     btn.textContent = on ? "Pause" : "Play";
     if (on && raf === null) raf = requestAnimationFrame(frame);
   }
-  btn.addEventListener("click", function () { setPlaying(!playing); });
+  btn.addEventListener("click", function () { setPlaying(!vs.playing); });
   range.addEventListener("input", function () {
-    oT = parseFloat(range.value);
-    if (!playing) render();
+    vs.oT = parseFloat(range.value);
+    if (!vs.playing) render();
   });
-  speedSel.addEventListener("change", function () { last = null; });
+  speedSel.addEventListener("change", function () {
+    vs.speed = speedSel.value; last = null;
+  });
 
   var dragging = false, lx = 0, ly = 0;
   canvas.addEventListener("pointerdown", function (ev) {
@@ -959,23 +971,29 @@ function drawOrbitView() {
   });
   canvas.addEventListener("pointermove", function (ev) {
     if (!dragging) return;
-    yaw += (ev.clientX - lx) * 0.008;
-    pitch = Math.max(-1.35, Math.min(1.35, pitch + (ev.clientY - ly) * 0.008));
+    vs.yaw += (ev.clientX - lx) * 0.008;
+    vs.pitch = Math.max(-1.35,
+                        Math.min(1.35, vs.pitch + (ev.clientY - ly) * 0.008));
     lx = ev.clientX; ly = ev.clientY;
-    if (!playing) render();
+    if (!vs.playing) render();
   });
+  // a drag ends however the browser says it ends — release, or the
+  // pointer being taken away (scroll gesture, leaving the viewport);
+  // the pose simply stays where the finger left it
   canvas.addEventListener("pointerup", function () { dragging = false; });
+  canvas.addEventListener("pointercancel", function () { dragging = false; });
 
   window.__orbitSeek = function (t) {
-    if (!playing) { oT = t; range.value = t; render(); }
+    if (!vs.playing) { vs.oT = t; range.value = t; render(); }
   };
   window.__orbitStop = function () {
     if (raf !== null) cancelAnimationFrame(raf);
     raf = null; window.__orbitSeek = null;
   };
-  btn.textContent = playing ? "Pause" : "Play";
+  btn.textContent = vs.playing ? "Pause" : "Play";
+  range.value = vs.oT;
   render();
-  if (playing) raf = requestAnimationFrame(frame);
+  if (vs.playing) raf = requestAnimationFrame(frame);
 }
 
 /* ---- crosshair + tooltip, shared across every chart ---- */
@@ -1087,8 +1105,10 @@ themebtn.addEventListener("click", function () {
   themebtn.textContent = "theme: " + t;
 });
 
+var lastBuildWidth = 0;
 function buildAll() {
   charts = [];
+  lastBuildWidth = document.getElementById("lanes").clientWidth;
   document.getElementById("lanes").textContent = "";
   drawChips(); drawTiles(); drawOrbitView(); drawTracks(); drawEvents();
   DATA.lanes.forEach(drawLane);
@@ -1097,7 +1117,14 @@ function buildAll() {
 var resizeTimer = null;
 window.addEventListener("resize", function () {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(buildAll, 150);
+  resizeTimer = setTimeout(function () {
+    // mobile browsers fire resize when the URL bar shows/hides (height
+    // only); rebuilding then would interrupt every drag and animation.
+    // Only a real width change invalidates the layout.
+    if (document.getElementById("lanes").clientWidth !== lastBuildWidth) {
+      buildAll();
+    }
+  }, 150);
 });
 buildAll();
 </script>

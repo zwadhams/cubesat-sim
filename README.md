@@ -20,8 +20,8 @@ falls out.
   and talk only over the bus.
 - **Polyglot flight software** — subsystems are written in the language
   their real-world counterpart would be: OBC in C (cFS heritage), ADCS in
-  Rust (planned, Phase 3), EPS bare-metal-style C (planned), comms C++
-  (planned), payload controller and ground segment in Python. Compiled
+  Rust, comms in C++, EPS bare-metal-style C (planned), payload controller
+  and ground segment in Python. Compiled
   subsystems run as separate OS processes behind `RemoteComponent`, a
   lockstep NDJSON stdin/stdout bridge that preserves determinism — the
   equivalence test requires the C OBC to fly bit-identically to the Python
@@ -41,7 +41,10 @@ Rules of the house:
 - [x] Phase 2.5 — process bridge + OBC ported to C (bit-identical to reference)
 - [x] Phase 3 — ADCS in Rust (B-dot detumble, sun pointing, momentum dump;
       attitude ↔ solar generation coupling; dipole magnetic field)
-- [ ] Phase 4 — data economy (payload, storage, comms windows)
+- [x] Phase 4 — data economy: payload imaging over targets, C++ comms with
+      bounded downlink queue, RF channel with contact windows and packet
+      loss, ground station whose operator rule closes a control loop
+      through space (telemetry down -> decision -> command up)
 - [ ] Phase 5 — FDIR, fault injection, degradation, Monte Carlo harness
 
 ## Getting started
@@ -50,9 +53,10 @@ Rules of the house:
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 make -C c/obc                                  # C flight software (OBC)
+make -C cpp/comms                              # C++ flight software (comms)
 cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
-.venv/bin/python examples/phase3_demo.py
+.venv/bin/python examples/phase4_demo.py
 ```
 
 To fly with the C OBC instead of the Python reference:

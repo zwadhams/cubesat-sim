@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from cubesat_sim.environment.groundstation import GroundSite
 from cubesat_sim.environment.magfield import dipole_field_eci
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.environment.sun import sun_direction_eci
@@ -40,6 +41,19 @@ ESSENTIAL_LOADS = frozenset({"obc", "radio"})
 MIN_CHARGE_TEMP_K = CELSIUS_ZERO_K  # li-ion cold-charge cutoff
 PANEL_NORMAL_BODY = np.array([0.0, 0.0, 1.0])
 
+DEFAULT_STATION = GroundSite("bozeman", 45.68, -111.04)
+DEFAULT_TARGETS = (
+    GroundSite("tokyo", 35.68, 139.69),
+    GroundSite("sao_paulo", -23.55, -46.63),
+    GroundSite("reykjavik", 64.13, -21.90),
+)
+CONTACT_MIN_ELEV_DEG = 10.0   # station pass threshold
+TARGET_MIN_ELEV_DEG = 25.0    # imaging look-angle limit
+RADIO_TX_POWER_W = 2.0        # transmitting costs real watts
+FRAME_DROP_PROB = 0.02        # RF packet loss inside a contact
+DOWNLINK_RATE_MB_S = 0.25     # channel rate: sets data-frame airtime
+TELEM_FRAME_AIRTIME_S = 0.5   # beacon airtime
+
 
 class SpacecraftPhysics(Component):
     def __init__(
@@ -50,6 +64,8 @@ class SpacecraftPhysics(Component):
         thermal: ThermalModel | None = None,
         attitude: AttitudeDynamics | None = None,
         loads: dict[str, float] | None = None,
+        station: GroundSite | None = None,
+        targets: tuple[GroundSite, ...] | None = None,
         initial_tumble_dps: float = 4.0,
         record_every_s: float = 5.0,
     ) -> None:
@@ -62,8 +78,11 @@ class SpacecraftPhysics(Component):
         self.loads = dict(loads or DEFAULT_LOADS)
         # essentials and adcs start powered; payload and heater wait for commands
         self.switches = {n: (n in ESSENTIAL_LOADS or n == "adcs") for n in self.loads}
+        self.station = station or DEFAULT_STATION
+        self.targets = targets if targets is not None else DEFAULT_TARGETS
         self.initial_tumble_dps = initial_tumble_dps
         self._record_every_s = record_every_s
+        self._prev_contact = False
         self._wheel_tau_cmd = np.zeros(3)
         self._mtq_m_cmd = np.zeros(3)
         self._gyro_bias: np.ndarray | None = None
@@ -74,6 +93,8 @@ class SpacecraftPhysics(Component):
     def on_start(self) -> None:
         self.subscribe("cmd/loads/*")
         self.subscribe("cmd/adcs/*")
+        self.subscribe("radio/tx")   # spacecraft transmitter into the channel
+        self.subscribe("ground/tx")  # ground transmitter into the channel
 
     def _init_run_state(self) -> None:
         """Seed-dependent initial conditions, drawn once on the first step."""
@@ -87,6 +108,8 @@ class SpacecraftPhysics(Component):
             self._init_run_state()
 
         # apply commands (essential loads cannot be switched off)
+        downlink_frames: list[dict] = []
+        uplink_frames: list[dict] = []
         for msg in self.drain():
             if msg.topic.startswith("cmd/loads/"):
                 name = msg.topic.rsplit("/", 1)[-1]
@@ -98,6 +121,10 @@ class SpacecraftPhysics(Component):
             elif msg.topic == "cmd/adcs/mtq":
                 self._mtq_m_cmd = np.array(
                     [msg.data["x"], msg.data["y"], msg.data["z"]], dtype=float)
+            elif msg.topic == "radio/tx":
+                downlink_frames.append(msg.data)
+            elif msg.topic == "ground/tx":
+                uplink_frames.append(msg.data)
 
         # environment truth
         sun_hat = sun_direction_eci(self.clock.utc)
@@ -129,6 +156,34 @@ class SpacecraftPhysics(Component):
                 f"attitude state non-finite at t={t:.0f}s — control loop "
                 "unstable for this timestep or corrupt actuator command")
 
+        # ground geometry and the RF channel: the physics layer IS the link.
+        # Frames only cross while the station sees the satellite, minus loss;
+        # transmitting costs watts whether or not anyone hears you.
+        when = self.clock.utc
+        station_elev = self.station.elevation_deg(r_eci, when)
+        contact = station_elev > CONTACT_MIN_ELEV_DEG
+        if contact != self._prev_contact:
+            self.event("contact_aos" if contact else "contact_los",
+                       elevation_deg=station_elev)
+            self._prev_contact = contact
+        target_visible = any(
+            site.elevation_deg(r_eci, when) > TARGET_MIN_ELEV_DEG
+            for site in self.targets)
+        # TX energy scales with airtime, not tick length — a beacon costs
+        # the same joules at dt=1 and dt=5
+        airtime_s = sum(
+            (float(d.get("mb", 0.0)) / DOWNLINK_RATE_MB_S
+             if d.get("kind") == "data" else TELEM_FRAME_AIRTIME_S)
+            for d in downlink_frames)
+        tx_w = RADIO_TX_POWER_W * min(dt, airtime_s) / dt
+        if contact:
+            for data in downlink_frames:
+                if self.rng.random() >= FRAME_DROP_PROB:
+                    self.publish("radio/rx_ground", **data)
+            for data in uplink_frames:
+                if self.rng.random() >= FRAME_DROP_PROB:
+                    self.publish("radio/rx_space", **data)
+
         # electrical truth (attitude-coupled generation)
         panel_eci = att.eci_from_body(PANEL_NORMAL_BODY)
         facing = float(np.dot(panel_eci, sun_hat))
@@ -136,7 +191,7 @@ class SpacecraftPhysics(Component):
         if p_gen > 0.0:
             p_gen *= max(0.0, 1.0 + float(self.rng.normal(0.0, 0.02)))
         heater_w = self.loads["bat_heater"] if self.switches["bat_heater"] else 0.0
-        p_load = sum(self.loads[n] for n, on in self.switches.items() if on)
+        p_load = sum(self.loads[n] for n, on in self.switches.items() if on) + tx_w
         p_net = p_gen - p_load
 
         # cold-charge inhibit: charging a frozen li-ion pack is forbidden;
@@ -202,6 +257,9 @@ class SpacecraftPhysics(Component):
         h = att.h_wheel
         self.publish("sensors/adcs/wheel_momentum",
                      x=float(h[0]), y=float(h[1]), z=float(h[2]))
+        self.publish("sensors/comms/carrier", detected=contact)
+        self.publish("sensors/payload/target_visible", visible=target_visible)
+        self.publish("sensors/payload/powered", on=self.switches["payload"])
 
         # ground-truth flight recording (never on the bus)
         every = max(1, round(self._record_every_s / dt))
@@ -218,3 +276,6 @@ class SpacecraftPhysics(Component):
             self.record("sun_facing", facing)
             self.record("wheel_h_frac",
                         float(np.max(np.abs(h)) / att.p.wheel_h_max_nms))
+            self.record("gs_contact", float(contact))
+            self.record("target_visible", float(target_visible))
+            self.record("tx_w", tx_w)

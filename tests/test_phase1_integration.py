@@ -4,7 +4,7 @@ import pytest
 
 from cubesat_sim.mission import build_sim
 
-pytestmark = pytest.mark.usefixtures("rust_adcs_binary")
+pytestmark = pytest.mark.usefixtures("rust_adcs_binary", "cpp_comms_binary")
 
 
 def orbit_period(sim):

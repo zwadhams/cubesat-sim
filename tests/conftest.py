@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from cubesat_sim.mission import C_OBC_BIN, REPO_ROOT, RUST_ADCS_BIN
+from cubesat_sim.mission import C_OBC_BIN, CPP_COMMS_BIN, REPO_ROOT, RUST_ADCS_BIN
 
 
 @pytest.fixture(scope="session")
@@ -14,6 +14,15 @@ def c_obc_binary():
     subprocess.run(["make", "-C", str(C_OBC_BIN.parent)],
                    check=True, capture_output=True)
     return C_OBC_BIN
+
+
+@pytest.fixture(scope="session")
+def cpp_comms_binary():
+    if shutil.which("make") is None or shutil.which("c++") is None:
+        pytest.skip("no C++ toolchain available")
+    subprocess.run(["make", "-C", str(CPP_COMMS_BIN.parent)],
+                   check=True, capture_output=True)
+    return CPP_COMMS_BIN
 
 
 @pytest.fixture(scope="session")

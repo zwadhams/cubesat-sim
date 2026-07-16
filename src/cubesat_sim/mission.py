@@ -12,11 +12,14 @@ from cubesat_sim.physics.spacecraft import SpacecraftPhysics
 from cubesat_sim.physics.thermal import ThermalModel
 from cubesat_sim.subsystems.eps import EPS
 from cubesat_sim.subsystems.obc import OBC
+from cubesat_sim.ground.station import GroundStation
+from cubesat_sim.subsystems.payload import PayloadController
 from cubesat_sim.subsystems.thermal_ctrl import ThermalControl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 C_OBC_BIN = REPO_ROOT / "c" / "obc" / "obc"
 RUST_ADCS_BIN = REPO_ROOT / "rust" / "adcs" / "target" / "release" / "adcs"
+CPP_COMMS_BIN = REPO_ROOT / "cpp" / "comms" / "comms"
 
 
 def build_sim(
@@ -29,8 +32,10 @@ def build_sim(
     initial_soc: float = 0.85,
     thermal_sun_w: float = 36.0,
     initial_tumble_dps: float = 4.0,
+    payload_rate_mb_s: float = 0.25,
     obc_impl: str = "python",
     adcs_impl: str = "rust",
+    comms_impl: str = "cpp",
 ) -> Simulation:
     """One CubeSat in a 500 km / 51.6 deg orbit: physics + EPS + OBC + thermal.
 
@@ -59,4 +64,10 @@ def build_sim(
         sim.add(RemoteComponent("adcs", period=1.0, argv=[str(RUST_ADCS_BIN)]))
     elif adcs_impl != "none":
         raise ValueError(f"unknown adcs_impl: {adcs_impl!r}")
+    sim.add(PayloadController(data_rate_mb_s=payload_rate_mb_s))
+    if comms_impl == "cpp":
+        sim.add(RemoteComponent("comms", period=1.0, argv=[str(CPP_COMMS_BIN)]))
+    elif comms_impl != "none":
+        raise ValueError(f"unknown comms_impl: {comms_impl!r}")
+    sim.add(GroundStation())
     return sim

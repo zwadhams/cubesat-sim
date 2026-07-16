@@ -25,18 +25,29 @@ def test_cpp_frames_decode_in_python():
     assert frames, "comms never built a beacon frame"
     import json
     decoded = 0
+    full_hk = 0
     for row in frames:
         parsed = ccsds.parse_tm_frame(
             bytes.fromhex(json.loads(row[5])["hex"]))
         assert parsed["asm_ok"] and parsed["crc_ok"]  # pre-channel: pristine
         assert parsed["scid"] == ccsds.SCID
         assert parsed["vcid"] == ccsds.VC_HOUSEKEEPING
-        (pkt,) = parsed["packets"]
-        assert pkt["apid"] == ccsds.APID_BEACON
-        hk = ccsds.unpack_beacon(pkt["data"])
+        apids = [p["apid"] for p in parsed["packets"]]
+        assert apids[0] == ccsds.APID_BEACON
+        hk = ccsds.unpack_beacon(parsed["packets"][0]["data"])
         assert 0.0 <= hk["storage_frac"] <= 1.0
+        if ccsds.APID_EPS_HK in apids and ccsds.APID_OBC_HK in apids:
+            full_hk += 1
+            eps = next(ccsds.unpack_eps_hk(p["data"])
+                       for p in parsed["packets"]
+                       if p["apid"] == ccsds.APID_EPS_HK)
+            assert 0.0 <= eps["soc_est"] <= 1.0
+            assert 5.0 < eps["battery_v"] < 10.0
         decoded += 1
     assert decoded >= 20
+    # after the first samples arrive, every beacon carries all three
+    # subsystems' packets
+    assert full_hk >= decoded - 2
 
     # the ground decoded beacons and archived science across the channel
     assert rec.telemetry("ground", "telemetry_frames")[-1][-1] > 0

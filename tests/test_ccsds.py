@@ -30,6 +30,46 @@ def test_tm_frame_round_trip():
     assert hk["tc_ack"] == 7 and hk["flags"] == 0b10
 
 
+def test_eps_and_obc_hk_round_trip():
+    eps = ccsds.unpack_eps_hk(ccsds.pack_eps_hk(0.4321, 7.912, 5.5, 4.25, True))
+    assert abs(eps["soc_est"] - 0.4321) < 1e-4
+    assert abs(eps["battery_v"] - 7.912) < 1e-3
+    assert abs(eps["solar_w"] - 5.5) < 1e-3
+    assert abs(eps["load_w"] - 4.25) < 1e-3
+    assert eps["shedding"] is True
+
+    obc = ccsds.unpack_obc_hk(
+        ccsds.pack_obc_hk(True, adcs_on=False, payload_on=True))
+    assert obc == {"safe": True, "adcs_on": False, "payload_on": True}
+
+
+def test_hk_words_saturate_never_wrap():
+    """A SEU-corrupted 1e300-volt reading must pack as full-scale, not
+    wrap into a small plausible number."""
+    eps = ccsds.unpack_eps_hk(
+        ccsds.pack_eps_hk(7.0, 1e300, -3.0, float("inf"), False))
+    assert eps["soc_est"] == 6.5535    # saturated word, decoded honestly
+    assert eps["battery_v"] == 65.535
+    assert eps["solar_w"] == 0.0       # negative clips to zero
+    assert eps["load_w"] == 65.535
+
+
+def test_multi_packet_housekeeping_frame():
+    """One beacon frame carries one packet per subsystem, demuxed by APID."""
+    packets = [
+        ccsds.build_space_packet(ccsds.APID_BEACON, 3,
+                                 ccsds.pack_beacon(0.1, 0, 0, 25.6, 0, 0)),
+        ccsds.build_space_packet(ccsds.APID_EPS_HK, 3,
+                                 ccsds.pack_eps_hk(0.8, 8.1, 6.0, 4.0, False)),
+        ccsds.build_space_packet(ccsds.APID_OBC_HK, 3,
+                                 ccsds.pack_obc_hk(False, True, True)),
+    ]
+    parsed = ccsds.parse_tm_frame(ccsds.build_tm_frame(0, 9, 9, packets))
+    assert parsed["crc_ok"]
+    assert [p["apid"] for p in parsed["packets"]] == [
+        ccsds.APID_BEACON, ccsds.APID_EPS_HK, ccsds.APID_OBC_HK]
+
+
 def test_tm_frame_counters_wrap():
     frame = ccsds.build_tm_frame(0, 256 + 5, 512 + 9, [])
     parsed = ccsds.parse_tm_frame(frame)

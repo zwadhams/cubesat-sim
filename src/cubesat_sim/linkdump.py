@@ -40,6 +40,19 @@ def _fmt_tm(data: dict, show_hex: bool) -> str:
                         f" sent={hk['sent_mb']:.1f}MB"
                         f" dropped={hk['dropped_mb']:.1f}MB"
                         f" ack={hk['tc_ack']} flags={hk['flags']:#04b}")
+            elif pkt["apid"] == ccsds.APID_EPS_HK:
+                eps = ccsds.unpack_eps_hk(pkt["data"])
+                out += (f" | eps#{pkt['seq']}: soc={eps['soc_est']:.1%}"
+                        f" v={eps['battery_v']:.2f}"
+                        f" gen={eps['solar_w']:.2f}W"
+                        f" load={eps['load_w']:.2f}W"
+                        f"{' SHED' if eps['shedding'] else ''}")
+            elif pkt["apid"] == ccsds.APID_OBC_HK:
+                obc = ccsds.unpack_obc_hk(pkt["data"])
+                out += (f" | obc#{pkt['seq']}:"
+                        f" {'SAFE' if obc['safe'] else 'NOMINAL'}"
+                        f" adcs={int(obc['adcs_on'])}"
+                        f" payload={int(obc['payload_on'])}")
             else:
                 out += f" apid={pkt['apid']:#05x} len={len(pkt['data'])}"
     if show_hex:

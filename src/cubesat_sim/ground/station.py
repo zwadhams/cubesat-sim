@@ -26,11 +26,15 @@ class GroundStation(Component):
         self,
         disable_above_frac: float = 0.8,
         enable_below_frac: float = 0.4,
+        power_disable_soc: float = 0.30,
+        power_enable_soc: float = 0.55,
         resend_every_s: float = 90.0,
     ) -> None:
         super().__init__("ground", period=1.0)
         self.disable_above_frac = disable_above_frac
         self.enable_below_frac = enable_below_frac
+        self.power_disable_soc = power_disable_soc
+        self.power_enable_soc = power_enable_soc
         self.resend_every_s = resend_every_s
         self.archive_mb = 0.0
         self.telemetry_frames = 0     # beacons decoded
@@ -39,7 +43,14 @@ class GroundStation(Component):
         self.seq_gaps = 0             # frame-counter discontinuities seen
         self.tc_retransmits = 0
         self.last_storage_frac: float | None = None
+        # the ground's picture of the spacecraft: whatever the last decoded
+        # housekeeping packets said, however stale that is by now
+        self.sat_soc_est: float | None = None
+        self.sat_shedding: bool | None = None
+        self.sat_safe_mode: bool | None = None
         self.desired_enable: bool | None = None  # None: no opinion yet
+        self._storage_veto = False
+        self._power_veto = False
         self._last_ack: int | None = None
         self._vc0_expect: int | None = None
         self._vc1_expect: int | None = None
@@ -75,6 +86,13 @@ class GroundStation(Component):
                 self.telemetry_frames += 1
                 self.last_storage_frac = hk["storage_frac"]
                 self._last_ack = hk["tc_ack"]
+            elif pkt["apid"] == ccsds.APID_EPS_HK:
+                eps = ccsds.unpack_eps_hk(pkt["data"])
+                self.sat_soc_est = eps["soc_est"]
+                self.sat_shedding = eps["shedding"]
+            elif pkt["apid"] == ccsds.APID_OBC_HK:
+                obc = ccsds.unpack_obc_hk(pkt["data"])
+                self.sat_safe_mode = obc["safe"]
 
     def _handle_vc1_burst(self, data: dict) -> None:
         n = int(data.get("frames", 0))
@@ -105,19 +123,38 @@ class GroundStation(Component):
             self.event("uplink_acked", seq=self._pending[0])
             self._pending = None
 
+        # operator rules: two independent vetoes with their own hysteresis,
+        # one payload-enable decision. Storage pressure was Phase 4; power
+        # protection is possible now that EPS health rides the beacon.
         if self.last_storage_frac is not None:
-            if (self.desired_enable is not False
-                    and self.last_storage_frac > self.disable_above_frac):
-                self.desired_enable = False
-                self._queue_command(ccsds.CMD_PAYLOAD_ENABLE, 0)
-                self.event("operator_disable_payload",
-                           storage_frac=self.last_storage_frac)
-            elif (self.desired_enable is False
-                    and self.last_storage_frac < self.enable_below_frac):
-                self.desired_enable = True
-                self._queue_command(ccsds.CMD_PAYLOAD_ENABLE, 1)
-                self.event("operator_enable_payload",
-                           storage_frac=self.last_storage_frac)
+            if not self._storage_veto and self.last_storage_frac > self.disable_above_frac:
+                self._storage_veto = True
+            elif self._storage_veto and self.last_storage_frac < self.enable_below_frac:
+                self._storage_veto = False
+        if self.sat_soc_est is not None:
+            if not self._power_veto and self.sat_soc_est < self.power_disable_soc:
+                self._power_veto = True
+            elif self._power_veto and self.sat_soc_est > self.power_enable_soc:
+                self._power_veto = False
+
+        if self.last_storage_frac is not None or self.sat_soc_est is not None:
+            desired = not (self._storage_veto or self._power_veto)
+            if self.desired_enable is None and desired:
+                self.desired_enable = True  # quiet: never uplink a default
+            elif desired != self.desired_enable:
+                self.desired_enable = desired
+                self._queue_command(ccsds.CMD_PAYLOAD_ENABLE,
+                                    1 if desired else 0)
+                detail: dict = {}
+                if not desired:
+                    detail["reason"] = ("storage" if self._storage_veto
+                                        else "power")
+                if self.last_storage_frac is not None:
+                    detail["storage_frac"] = self.last_storage_frac
+                if self.sat_soc_est is not None:
+                    detail["soc_est"] = self.sat_soc_est
+                self.event("operator_enable_payload" if desired
+                           else "operator_disable_payload", **detail)
 
         if self._pending is not None and (
                 self._last_sent is None
@@ -137,6 +174,13 @@ class GroundStation(Component):
         self.record("frames_rejected", float(self.frames_rejected))
         self.record("seq_gaps", float(self.seq_gaps))
         self.record("tc_retransmits", float(self.tc_retransmits))
+        # the ground's belief about the spacecraft — frozen between passes
+        if self.sat_soc_est is not None:
+            self.record("sat_soc_est", self.sat_soc_est)
+        if self.sat_safe_mode is not None:
+            self.record("sat_safe_mode", float(self.sat_safe_mode))
+        if self.sat_shedding is not None:
+            self.record("sat_shedding", float(self.sat_shedding))
 
     def _queue_command(self, cmd_id: int, arg: int) -> None:
         self._pending = (self._tc_seq, cmd_id, arg)

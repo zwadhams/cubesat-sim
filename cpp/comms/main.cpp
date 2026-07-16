@@ -34,7 +34,9 @@ constexpr double kBeaconPeriodS = 30.0;
 constexpr uint16_t kScid = 0x0C5;
 constexpr int kTmFrameLen = 96;
 constexpr int kTmDataLen = 84;
-constexpr uint16_t kApidBeacon = 0x020;
+constexpr uint16_t kApidBeacon = 0x020;   // comms-local health
+constexpr uint16_t kApidEpsHk = 0x040;    // power subsystem health words
+constexpr uint16_t kApidObcHk = 0x060;    // mode + load-request state
 constexpr uint8_t kCmdPayloadEnable = 0x01;
 
 bool contains(const std::string& s, const char* needle) {
@@ -113,6 +115,26 @@ void put_u32(uint8_t* p, uint32_t v) {
     p[3] = static_cast<uint8_t>(v & 0xFF);
 }
 
+// telemetry words clip, they never wrap: a bit-flipped 1e300 volt
+// reading packs as 65535, not garbage
+uint16_t sat_u16(double v) {
+    if (!(v > 0.0)) {
+        return 0;
+    }
+    if (v >= 65535.0) {
+        return 65535;
+    }
+    return static_cast<uint16_t>(v + 0.5);
+}
+
+uint8_t* write_pkt_header(uint8_t* p, uint16_t apid, uint16_t seq,
+                          uint16_t payload_len) {
+    put_u16(p, apid);
+    put_u16(p + 2, static_cast<uint16_t>(0xC000 | (seq & 0x3FFF)));
+    put_u16(p + 4, static_cast<uint16_t>(payload_len - 1));
+    return p + 6;
+}
+
 std::string to_hex(const uint8_t* data, size_t len) {
     static const char* digits = "0123456789abcdef";
     std::string out;
@@ -177,6 +199,41 @@ class Comms {
                 std::string hex;
                 if (find_str(seg, "\"hex\":\"", &hex)) {
                     tc_hex.push_back(hex);
+                }
+            } else if (seg.rfind("eps/status\"", 0) == 0) {
+                // sample power health off the bus for the housekeeping frame
+                double v = 0.0;
+                bool b = false;
+                if (find_num(seg, "\"soc_est\":", &v)) {
+                    eps_soc_ = v;
+                    has_eps_ = true;
+                }
+                if (find_num(seg, "\"battery_v\":", &v)) {
+                    eps_vbatt_ = v;
+                }
+                if (find_num(seg, "\"solar_w\":", &v)) {
+                    eps_solar_ = v;
+                }
+                if (find_num(seg, "\"load_w\":", &v)) {
+                    eps_load_ = v;
+                }
+                if (find_bool(seg, "\"shedding\":", &b)) {
+                    eps_shedding_ = b;
+                }
+            } else if (seg.rfind("obc/mode\"", 0) == 0) {
+                std::string mode;
+                if (find_str(seg, "\"mode\":\"", &mode)) {
+                    obc_safe_ = (mode == "SAFE");
+                    has_obc_ = true;
+                }
+            } else if (seg.rfind("obc/request/loads\"", 0) == 0) {
+                bool b = false;
+                if (find_bool(seg, "\"adcs\":", &b)) {
+                    obc_adcs_ = b;
+                    has_obc_ = true;
+                }
+                if (find_bool(seg, "\"payload\":", &b)) {
+                    obc_payload_ = b;
                 }
             }
         }
@@ -315,24 +372,44 @@ class Comms {
         put_u16(f + 8, 0);
         std::memset(f + 10, 0x55, kTmDataLen);  // idle fill
 
-        // one space packet: the housekeeping beacon
+        // housekeeping frame: one space packet per subsystem heard on the
+        // bus, demultiplexed at the ground by APID
         uint8_t* p = f + 10;
-        put_u16(p, kApidBeacon);                       // version 0, TM, APID
-        put_u16(p + 2, static_cast<uint16_t>(0xC000 | (beacon_seq_ & 0x3FFF)));
-        put_u16(p + 4, 16 - 1);                        // payload length - 1
-        uint8_t* hk = p + 6;
+        p = write_pkt_header(p, kApidBeacon, beacon_seq_, 16);
         double frac = queue_mb_ / kQueueCapacityMb;
-        put_u16(hk, static_cast<uint16_t>(frac * 10000.0 + 0.5));
-        put_u32(hk + 2, static_cast<uint32_t>(dropped_mb_ * 1024.0 + 0.5));
-        put_u32(hk + 6, static_cast<uint32_t>(sent_mb_ * 1024.0 + 0.5));
-        put_u16(hk + 10, static_cast<uint16_t>(queue_mb_ * 10.0 + 0.5));
-        hk[12] = tc_expected_;
-        hk[13] = static_cast<uint8_t>((full ? 1 : 0) | (carrier_ ? 2 : 0));
-        put_u16(hk + 14, 0);
+        put_u16(p, static_cast<uint16_t>(frac * 10000.0 + 0.5));
+        put_u32(p + 2, static_cast<uint32_t>(dropped_mb_ * 1024.0 + 0.5));
+        put_u32(p + 6, static_cast<uint32_t>(sent_mb_ * 1024.0 + 0.5));
+        put_u16(p + 10, static_cast<uint16_t>(queue_mb_ * 10.0 + 0.5));
+        p[12] = tc_expected_;
+        p[13] = static_cast<uint8_t>((full ? 1 : 0) | (carrier_ ? 2 : 0));
+        put_u16(p + 14, 0);
+        p += 16;
+        beacon_seq_ = static_cast<uint16_t>((beacon_seq_ + 1) & 0x3FFF);
+        if (has_eps_) {
+            p = write_pkt_header(p, kApidEpsHk, eps_seq_, 12);
+            put_u16(p, sat_u16(eps_soc_ * 10000.0));
+            put_u16(p + 2, sat_u16(eps_vbatt_ * 1000.0));
+            put_u16(p + 4, sat_u16(eps_solar_ * 1000.0));
+            put_u16(p + 6, sat_u16(eps_load_ * 1000.0));
+            p[8] = eps_shedding_ ? 1 : 0;
+            p[9] = 0;
+            put_u16(p + 10, 0);
+            p += 12;
+            eps_seq_ = static_cast<uint16_t>((eps_seq_ + 1) & 0x3FFF);
+        }
+        if (has_obc_) {
+            p = write_pkt_header(p, kApidObcHk, obc_seq_, 6);
+            p[0] = obc_safe_ ? 1 : 0;
+            p[1] = static_cast<uint8_t>((obc_adcs_ ? 1 : 0) |
+                                        (obc_payload_ ? 2 : 0));
+            put_u32(p + 2, 0);
+            p += 6;
+            obc_seq_ = static_cast<uint16_t>((obc_seq_ + 1) & 0x3FFF);
+        }
 
         put_u16(f + kTmFrameLen - 2,
                 crc16(f + 4, kTmFrameLen - 4 - 2));
-        beacon_seq_ = static_cast<uint16_t>((beacon_seq_ + 1) & 0x3FFF);
         vc0_count_ = static_cast<uint8_t>(vc0_count_ + 1);
         mc_count_ = static_cast<uint8_t>(mc_count_ + 1);
         return to_hex(f, sizeof f);
@@ -348,7 +425,20 @@ class Comms {
     uint8_t vc0_count_ = 0;
     long vc1_count_ = 0;
     uint16_t beacon_seq_ = 0;
+    uint16_t eps_seq_ = 0;
+    uint16_t obc_seq_ = 0;
     uint8_t tc_expected_ = 0;
+    // last-heard subsystem health, sampled off the bus for housekeeping
+    bool has_eps_ = false;
+    double eps_soc_ = 0.0;
+    double eps_vbatt_ = 0.0;
+    double eps_solar_ = 0.0;
+    double eps_load_ = 0.0;
+    bool eps_shedding_ = false;
+    bool has_obc_ = false;
+    bool obc_safe_ = false;
+    bool obc_adcs_ = true;
+    bool obc_payload_ = true;
 };
 
 }  // namespace
@@ -369,7 +459,8 @@ int main() {
         }
         if (contains(line, "\"type\":\"init\"")) {
             std::printf("{\"type\":\"ready\",\"subscribe\":[\"payload/data\","
-                        "\"sensors/comms/*\",\"radio/rx_space\"]}\n");
+                        "\"sensors/comms/*\",\"radio/rx_space\",\"eps/status\","
+                        "\"obc/mode\",\"obc/request/loads\"]}\n");
             std::fflush(stdout);
         } else if (contains(line, "\"type\":\"shutdown\"")) {
             break;

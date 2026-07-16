@@ -43,6 +43,7 @@ ANALOG_LANES = [
     ("State of charge", "fraction", (0.0, 1.0), [
         ("physics", "soc_true", "true", _ID),
         ("eps", "soc_est", "EPS estimate", _ID),
+        ("ground", "sat_soc_est", "ground last heard", _ID),
     ]),
     ("Electrical power", "W", None, [
         ("physics", "p_gen_w", "generation", _ID),

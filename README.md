@@ -58,6 +58,11 @@ falls out.
   frames by CRC and *sees* the losses as frame-counter gaps, and
   uplinked commands run a FARM-style ARQ loop: sequence-numbered TC
   frames retransmitted until the beacon's acceptance counter advances.
+  Every beacon multiplexes one space packet per subsystem (comms 0x020,
+  EPS power health 0x040, OBC mode/FDIR 0x060), so the ground's picture
+  of the spacecraft — exposed as `sat_*` telemetry, frozen between
+  passes — comes through the real protocol, and its operator runs a
+  power-protection veto beside the storage rule.
   `python -m cubesat_sim.linkdump <recording.db>` plays protocol
   analyzer over any flight.
 

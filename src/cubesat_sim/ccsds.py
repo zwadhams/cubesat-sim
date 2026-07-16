@@ -43,7 +43,9 @@ TM_FRAME_LEN = 96
 TM_DATA_LEN = TM_FRAME_LEN - len(ASM) - 6 - 2  # 84
 IDLE_FILL = 0x55
 
-APID_BEACON = 0x020
+APID_BEACON = 0x020   # comms-local health (storage, counters, TC ack)
+APID_EPS_HK = 0x040   # power subsystem health words
+APID_OBC_HK = 0x060   # mode and load-request state
 VC_HOUSEKEEPING = 0
 VC_SCIENCE = 1
 VC1_FRAME_BITS = (1024 + 32) * 8  # science frame: 1 KiB payload + overhead
@@ -141,6 +143,55 @@ def unpack_beacon(data: bytes) -> dict:
         "queue_mb": queue_e1 / 10.0,
         "tc_ack": tc_ack,
         "flags": flags,
+    }
+
+
+def _sat16(v: float) -> int:
+    """Saturating unsigned 16-bit conversion — telemetry words clip, they
+    never wrap (a bit-flipped 1e300 volt reading packs as 65535). Clamp
+    before rounding: round(inf) raises."""
+    if not v > 0.0:  # also catches NaN
+        return 0
+    if v >= 65535.0:
+        return 65535
+    return round(v)
+
+
+# -- EPS housekeeping payload (12 bytes) --------------------------------------
+
+def pack_eps_hk(soc_est: float, battery_v: float, solar_w: float,
+                load_w: float, shedding: bool) -> bytes:
+    return struct.pack(">HHHHBBH",
+                       _sat16(soc_est * 10000.0), _sat16(battery_v * 1000.0),
+                       _sat16(solar_w * 1000.0), _sat16(load_w * 1000.0),
+                       1 if shedding else 0, 0, 0)
+
+
+def unpack_eps_hk(data: bytes) -> dict:
+    soc_e4, batt_mv, solar_mw, load_mw, flags, _, _ = struct.unpack(
+        ">HHHHBBH", data)
+    return {
+        "soc_est": soc_e4 / 10000.0,
+        "battery_v": batt_mv / 1000.0,
+        "solar_w": solar_mw / 1000.0,
+        "load_w": load_mw / 1000.0,
+        "shedding": bool(flags & 1),
+    }
+
+
+# -- OBC housekeeping payload (6 bytes) ---------------------------------------
+
+def pack_obc_hk(safe: bool, adcs_on: bool, payload_on: bool) -> bytes:
+    return struct.pack(">BBI", 1 if safe else 0,
+                       (1 if adcs_on else 0) | (2 if payload_on else 0), 0)
+
+
+def unpack_obc_hk(data: bytes) -> dict:
+    mode, flags, _ = struct.unpack(">BBI", data)
+    return {
+        "safe": mode == 1,
+        "adcs_on": bool(flags & 1),
+        "payload_on": bool(flags & 2),
     }
 
 

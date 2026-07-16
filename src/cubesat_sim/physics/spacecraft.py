@@ -25,7 +25,11 @@ component models themselves.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+from cubesat_sim.ccsds import VC1_FRAME_BITS
 
 from cubesat_sim.environment.groundstation import GroundSite
 from cubesat_sim.environment.magfield import dipole_field_eci
@@ -58,9 +62,13 @@ DEFAULT_TARGETS = (
 CONTACT_MIN_ELEV_DEG = 10.0   # station pass threshold
 TARGET_MIN_ELEV_DEG = 25.0    # imaging look-angle limit
 RADIO_TX_POWER_W = 2.0        # transmitting costs real watts
-FRAME_DROP_PROB = 0.02        # RF packet loss inside a contact
-DOWNLINK_RATE_MB_S = 0.25     # channel rate: sets data-frame airtime
-TELEM_FRAME_AIRTIME_S = 0.5   # beacon airtime
+DOWNLINK_RATE_MB_S = 0.25     # channel rate for VC1 burst airtime
+LINK_RATE_BPS = 2_000_000     # the same rate, in bits, for byte-true frames
+BURST_OVERHEAD_S = 0.02       # preamble/ramp-up per transmitted burst
+# bit error rate vs elevation: slant range (so SNR) is worst at the horizon.
+# log-linear in normalized sin(elevation) between these anchors:
+BER_AT_MIN_ELEV = 1e-4        # at the 10 deg contact threshold
+BER_AT_ZENITH = 1e-6
 
 
 class SpacecraftPhysics(Component):
@@ -100,6 +108,8 @@ class SpacecraftPhysics(Component):
         self._stuck: dict[str, str] = {}          # sensor -> "soft" | "hard"
         self._stuck_vals: dict[str, tuple] = {}   # latched output words
         self._seu_pending: list[str] = []         # sensors owed a bit flip
+        self._ber_mult = 1.0                      # fault/channel scintillation
+        self._last_ber = 0.0
 
     def on_start(self) -> None:
         self.subscribe("cmd/loads/*")
@@ -130,6 +140,28 @@ class SpacecraftPhysics(Component):
             self.event("seu_corruption", sensor=sensor)
             values = tuple(vals)
         return values
+
+    def _link_ber(self, elev_deg: float) -> float:
+        """Bit error rate for the current pass geometry: log-linear in
+        normalized sin(elevation) between the horizon and zenith anchors."""
+        s_min = math.sin(math.radians(CONTACT_MIN_ELEV_DEG))
+        s_el = math.sin(math.radians(max(elev_deg, CONTACT_MIN_ELEV_DEG)))
+        x = (s_el - s_min) / (1.0 - s_min)
+        log_ber = (math.log10(BER_AT_MIN_ELEV)
+                   + x * (math.log10(BER_AT_ZENITH) - math.log10(BER_AT_MIN_ELEV)))
+        return self._ber_mult * 10.0 ** log_ber
+
+    def _corrupt_hex(self, hex_str: str, ber: float) -> str:
+        """Pass a byte-true frame through the noisy channel: draw the
+        number of bit errors, flip those bits. The CRC finds them later."""
+        data = bytearray.fromhex(hex_str)
+        n_bits = len(data) * 8
+        n_err = int(self.rng.binomial(n_bits, ber))
+        if n_err:
+            for pos in self.rng.choice(n_bits, size=min(n_err, n_bits),
+                                       replace=False):
+                data[pos // 8] ^= 1 << (7 - (pos % 8))
+        return data.hex()
 
     def _init_run_state(self) -> None:
         """Seed-dependent initial conditions, drawn once on the first step."""
@@ -166,6 +198,8 @@ class SpacecraftPhysics(Component):
                 self.attitude.p.wheel_friction_nm_per_nms = float(msg.data["nm_per_nms"])
             elif msg.topic == "fault/array_hit":
                 self.array.illumination *= float(msg.data["mult"])
+            elif msg.topic == "fault/channel":
+                self._ber_mult = float(msg.data.get("ber_mult", 1.0))
             elif msg.topic == "cmd/adcs/wheel_torque":
                 self._wheel_tau_cmd = np.array(
                     [msg.data["x"], msg.data["y"], msg.data["z"]], dtype=float)
@@ -220,20 +254,44 @@ class SpacecraftPhysics(Component):
         target_visible = any(
             site.elevation_deg(r_eci, when) > TARGET_MIN_ELEV_DEG
             for site in self.targets)
-        # TX energy scales with airtime, not tick length — a beacon costs
+        # TX energy scales with airtime, not tick length — a frame costs
         # the same joules at dt=1 and dt=5
-        airtime_s = sum(
-            (float(d.get("mb", 0.0)) / DOWNLINK_RATE_MB_S
-             if d.get("kind") == "data" else TELEM_FRAME_AIRTIME_S)
-            for d in downlink_frames)
+        airtime_s = 0.0
+        for d in downlink_frames:
+            if d.get("kind") == "vc1_burst":
+                airtime_s += float(d.get("mb", 0.0)) / DOWNLINK_RATE_MB_S
+            else:
+                airtime_s += (len(d.get("hex", "")) * 4.0 / LINK_RATE_BPS
+                              + BURST_OVERHEAD_S)
         tx_w = RADIO_TX_POWER_W * min(dt, airtime_s) / dt
+
+        # the channel itself: frames cross only during contact, picking up
+        # bit errors along the way. Byte-true frames get real bit flips
+        # (the ground's CRC does the rejecting); VC1 bursts get a binomial
+        # draw of corrupted frames out of the burst.
+        self._last_ber = self._link_ber(station_elev) if contact else 0.0
         if contact:
-            for data in downlink_frames:
-                if self.rng.random() >= FRAME_DROP_PROB:
-                    self.publish("radio/rx_ground", **data)
-            for data in uplink_frames:
-                if self.rng.random() >= FRAME_DROP_PROB:
-                    self.publish("radio/rx_space", **data)
+            ber = self._last_ber
+            for d in downlink_frames:
+                if d.get("kind") == "tm_frame":
+                    self.publish("radio/rx_ground", kind="tm_frame",
+                                 hex=self._corrupt_hex(d["hex"], ber))
+                elif d.get("kind") == "vc1_burst":
+                    n = int(d.get("frames", 0))
+                    p_frame = 1.0 - (1.0 - ber) ** VC1_FRAME_BITS
+                    bad = int(self.rng.binomial(n, p_frame)) if n > 0 else 0
+                    self.publish("radio/rx_ground", kind="vc1_burst",
+                                 frames=n, bad=bad,
+                                 mb=float(d.get("mb", 0.0)),
+                                 vcfc0=int(d.get("vcfc0", 0)))
+                else:
+                    self.publish("radio/rx_ground", **d)
+            for d in uplink_frames:
+                if "hex" in d:
+                    self.publish("radio/rx_space", kind="tc_frame",
+                                 hex=self._corrupt_hex(d["hex"], ber))
+                else:
+                    self.publish("radio/rx_space", **d)
 
         # electrical truth (attitude-coupled generation)
         panel_eci = att.eci_from_body(PANEL_NORMAL_BODY)
@@ -339,3 +397,5 @@ class SpacecraftPhysics(Component):
             self.record("tx_w", tx_w)
             self.record("batt_capacity_wh", self.battery.capacity_wh)
             self.record("array_illum", self.array.illumination)
+            if contact:
+                self.record("link_ber", self._last_ber)

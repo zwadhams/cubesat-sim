@@ -85,6 +85,11 @@ def array_hit(at_s: float, mult: float) -> ScheduledFault:
     return ScheduledFault(at_s, "fault/array_hit", {"mult": mult})
 
 
+def channel_ber(at_s: float, mult: float) -> ScheduledFault:
+    """Scintillation / interference: scale the RF channel's bit error rate."""
+    return ScheduledFault(at_s, "fault/channel", {"ber_mult": mult})
+
+
 class FaultInjector(Component):
     def __init__(
         self,

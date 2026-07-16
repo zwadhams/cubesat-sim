@@ -71,6 +71,11 @@ ANALOG_LANES = [
         ("ground", "archive_mb", "ground archive", _ID),
         ("comms", "dropped_mb", "dropped", _ID),
     ]),
+    ("Link", "count", None, [
+        ("ground", "frames_rejected", "frames rejected", _ID),
+        ("ground", "seq_gaps", "sequence gaps", _ID),
+        ("ground", "tc_retransmits", "TC retransmits", _ID),
+    ]),
     ("Battery capacity", "Wh", None, [
         ("physics", "batt_capacity_wh", "capacity", _ID),
     ]),

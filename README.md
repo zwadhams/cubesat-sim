@@ -42,11 +42,24 @@ falls out.
   (NOMINAL/SAFE/SHED/FDIR_GIVEUP/BROWNED_OUT/DEAD/CRASHED).
 - **Flight reports** (`cubesat_sim.dashboard`) — renders any flight
   recording into a single self-contained HTML file (no server, no
-  dependencies): stat tiles, a digital state strip (eclipse, contact,
-  safe mode, shedding, ...), an event timeline with severity glyphs,
-  and telemetry lanes with a shared crosshair, eclipse shading, and
-  table views. Its first render caught a wrong mechanism claim in
-  catalog entry 7.
+  dependencies): an animated orbit view, stat tiles, a digital state
+  strip (eclipse, contact, safe mode, shedding, ...), an event timeline
+  with severity glyphs, and telemetry lanes with a shared crosshair,
+  eclipse shading, and table views. Its first render caught a wrong
+  mechanism claim in catalog entry 7.
+- **The space link is a real protocol** (`cubesat_sim.ccsds` +
+  `cubesat_sim.linkdump`) — housekeeping telemetry crosses the channel
+  as byte-true CCSDS-style TM transfer frames (sync marker, frame
+  counters, space packets, CRC-16 FECF) built by the C++ flight framer
+  and decoded by an independent Python ground implementation; bulk
+  science moves on virtual channel 1 as frame-accounted bursts. The
+  channel applies an elevation-dependent bit error rate (pass edges are
+  lossy; scintillation faults crank it), the ground rejects corrupted
+  frames by CRC and *sees* the losses as frame-counter gaps, and
+  uplinked commands run a FARM-style ARQ loop: sequence-numbered TC
+  frames retransmitted until the beacon's acceptance counter advances.
+  `python -m cubesat_sim.linkdump <recording.db>` plays protocol
+  analyzer over any flight.
 
 Rules of the house:
 
@@ -71,9 +84,12 @@ Rules of the house:
       bit flips peaking over the South Atlantic Anomaly, bearing wear,
       debris strikes), continuous degradation (battery fade, array
       darkening), and a Monte Carlo campaign harness
-- [x] Phase 6a — flight report dashboard (recording -> self-contained HTML)
-- [ ] Phase 6b — network comms realism (CCSDS-style framing; noted as a
-      priority — MQTT-style live transport deliberately avoided to keep
+- [x] Phase 6a — flight report dashboard (recording -> self-contained HTML,
+      including the animated orbit view)
+- [x] Phase 6b — the link as a real protocol: CCSDS-style TM/TC framing
+      with CRC-16, frame counters and sequence gaps, elevation-dependent
+      bit error rate, FARM-style command ARQ, and the linkdump analyzer
+      (MQTT-style live transport deliberately avoided to keep
       byte-identical replay)
 - [ ] Phase 6c — second satellite (deferred until the single-sat setup is
       thoroughly explored)
@@ -87,8 +103,9 @@ make -C c/obc                                  # C flight software (OBC)
 make -C cpp/comms                              # C++ flight software (comms)
 cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
-.venv/bin/python examples/phase5_demo.py
-.venv/bin/python -m cubesat_sim.dashboard runs/phase5_hard_failure.db  # -> .html
+.venv/bin/python examples/phase6_link_demo.py
+.venv/bin/python -m cubesat_sim.dashboard runs/phase6_link.db   # -> .html report
+.venv/bin/python -m cubesat_sim.linkdump runs/phase6_link.db    # decode the link
 ```
 
 To fly with the C OBC instead of the Python reference:

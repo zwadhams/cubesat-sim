@@ -33,6 +33,10 @@ class Simulation:
         self.dt = dt
         self.seed = seed
         self.clock = SimClock(dt=dt) if epoch is None else SimClock(dt=dt, epoch=epoch)
+        if recorder_path is not None:
+            # a new simulation must never append onto an old recording —
+            # re-flying into the same path silently doubled every row
+            Path(recorder_path).unlink(missing_ok=True)
         self.recorder = FlightRecorder(recorder_path)
         self.recorder.set_meta(seed=seed, dt=dt, epoch=self.clock.epoch.isoformat())
         self.bus = MessageBus(self.clock, self.recorder)

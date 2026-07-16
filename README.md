@@ -28,7 +28,7 @@ Rules of the house:
 ## Build phases
 
 - [x] Phase 0 — kernel: clock, bus, components, RNG, flight recorder
-- [ ] Phase 1 — orbit + power (eclipse cycles breathing through the EPS)
+- [x] Phase 1 — orbit + power (eclipse cycles breathing through the EPS)
 - [ ] Phase 2 — thermal (heater/battery coupling)
 - [ ] Phase 3 — ADCS (attitude ↔ solar generation coupling)
 - [ ] Phase 4 — data economy (payload, storage, comms windows)

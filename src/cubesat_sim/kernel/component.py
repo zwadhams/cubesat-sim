@@ -40,6 +40,10 @@ class Component:
         return tick % self._every_ticks == 0
 
     @property
+    def clock(self):
+        return self._sim.clock
+
+    @property
     def step_dt(self) -> float:
         """Simulated seconds elapsed between two of this component's steps."""
         return self._every_ticks * self._sim.clock.dt

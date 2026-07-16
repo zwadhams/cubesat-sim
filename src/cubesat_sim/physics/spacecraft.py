@@ -1,23 +1,30 @@
 """The spacecraft physics component — the only place ground truth lives.
 
-Every tick it propagates the orbit, works out sun/eclipse, applies switched
-loads, advances the thermal state, and integrates the battery. It publishes
+Every tick it propagates the orbit, works out sun/eclipse and the local
+magnetic field, advances rigid-body attitude, applies switched loads,
+advances the thermal state, and integrates the battery. It publishes
 *noisy sensor readings* to the bus; subsystems never see truth. Actuation
-comes back in as `cmd/loads/*` switch commands.
+comes back in as `cmd/loads/*` switches, `cmd/adcs/wheel_torque`, and
+`cmd/adcs/mtq`.
 
-One hard physical constraint couples power to thermal: lithium-ion cells
-must not charge below 0 C. When the battery is that cold, charge power is
-inhibited and dumped as heat into the structure instead. Combined with a
-sheddable heater, this is the raw material of a death spiral.
+Cross-couplings that make life interesting:
+- solar generation scales with how well the +Z panel faces the sun, so
+  attitude trouble is power trouble;
+- ADCS actuator commands are honored only while the `adcs` load switch is
+  powered — shed the ADCS and the satellite starts to drift;
+- lithium-ion cells must not charge below 0 C (blocked charge power dumps
+  as heat into the structure).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from cubesat_sim.environment.magfield import dipole_field_eci
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.environment.sun import sun_direction_eci
 from cubesat_sim.kernel.component import Component
+from cubesat_sim.physics.attitude import AttitudeDynamics
 from cubesat_sim.physics.power import Battery, SolarArray
 from cubesat_sim.physics.thermal import CELSIUS_ZERO_K, ThermalModel
 
@@ -31,6 +38,7 @@ DEFAULT_LOADS = {
 ESSENTIAL_LOADS = frozenset({"obc", "radio"})
 
 MIN_CHARGE_TEMP_K = CELSIUS_ZERO_K  # li-ion cold-charge cutoff
+PANEL_NORMAL_BODY = np.array([0.0, 0.0, 1.0])
 
 
 class SpacecraftPhysics(Component):
@@ -40,7 +48,9 @@ class SpacecraftPhysics(Component):
         array: SolarArray | None = None,
         battery: Battery | None = None,
         thermal: ThermalModel | None = None,
+        attitude: AttitudeDynamics | None = None,
         loads: dict[str, float] | None = None,
+        initial_tumble_dps: float = 4.0,
         record_every_s: float = 5.0,
     ) -> None:
         super().__init__("physics", period=0.0)  # every tick
@@ -48,36 +58,81 @@ class SpacecraftPhysics(Component):
         self.array = array or SolarArray()
         self.battery = battery or Battery()
         self.thermal = thermal or ThermalModel()
+        self.attitude = attitude or AttitudeDynamics()
         self.loads = dict(loads or DEFAULT_LOADS)
         # essentials and adcs start powered; payload and heater wait for commands
         self.switches = {n: (n in ESSENTIAL_LOADS or n == "adcs") for n in self.loads}
+        self.initial_tumble_dps = initial_tumble_dps
         self._record_every_s = record_every_s
+        self._wheel_tau_cmd = np.zeros(3)
+        self._mtq_m_cmd = np.zeros(3)
+        self._gyro_bias: np.ndarray | None = None
         self._prev_eclipse: bool | None = None
         self._brownout = False
         self._charge_blocked = False
 
     def on_start(self) -> None:
         self.subscribe("cmd/loads/*")
+        self.subscribe("cmd/adcs/*")
+
+    def _init_run_state(self) -> None:
+        """Seed-dependent initial conditions, drawn once on the first step."""
+        spin_axis = self.rng.normal(size=3)
+        spin_axis /= np.linalg.norm(spin_axis)
+        self.attitude.omega = np.deg2rad(self.initial_tumble_dps) * spin_axis
+        self._gyro_bias = np.deg2rad(self.rng.normal(0.0, 0.05, size=3))
 
     def step(self, t: float, dt: float) -> None:
-        # apply switch commands (essential loads cannot be switched off)
+        if self._gyro_bias is None:
+            self._init_run_state()
+
+        # apply commands (essential loads cannot be switched off)
         for msg in self.drain():
-            name = msg.topic.rsplit("/", 1)[-1]
-            if name in self.loads and name not in ESSENTIAL_LOADS:
-                self.switches[name] = bool(msg.data.get("on"))
+            if msg.topic.startswith("cmd/loads/"):
+                name = msg.topic.rsplit("/", 1)[-1]
+                if name in self.loads and name not in ESSENTIAL_LOADS:
+                    self.switches[name] = bool(msg.data.get("on"))
+            elif msg.topic == "cmd/adcs/wheel_torque":
+                self._wheel_tau_cmd = np.array(
+                    [msg.data["x"], msg.data["y"], msg.data["z"]], dtype=float)
+            elif msg.topic == "cmd/adcs/mtq":
+                self._mtq_m_cmd = np.array(
+                    [msg.data["x"], msg.data["y"], msg.data["z"]], dtype=float)
 
         # environment truth
         sun_hat = sun_direction_eci(self.clock.utc)
         r_eci = self.orbit.position_eci(t)
         eclipse = self.orbit.in_eclipse(r_eci, sun_hat)
+        b_eci = dipole_field_eci(r_eci)
         if self._prev_eclipse is None:
             self._prev_eclipse = eclipse
         elif eclipse != self._prev_eclipse:
             self.event("eclipse_enter" if eclipse else "eclipse_exit")
             self._prev_eclipse = eclipse
 
-        # electrical truth
-        p_gen = self.array.generation_w(eclipse)
+        # attitude truth
+        att = self.attitude
+        b_body = att.body_from_eci(b_eci)
+        nadir_body = att.body_from_eci(-r_eci / np.linalg.norm(r_eci))
+        inertia = att.p.inertia_kg_m2
+        n_orb = self.orbit.mean_motion_rad_s
+        tau_gg = 3.0 * n_orb**2 * np.cross(nadir_body, inertia * nadir_body)
+        tau_res = np.cross(att.p.residual_dipole_am2, b_body)
+        tau_noise = self.rng.normal(0.0, att.p.dist_torque_std_nm, size=3)
+
+        adcs_powered = self.switches["adcs"]
+        wheel_cmd = self._wheel_tau_cmd if adcs_powered else np.zeros(3)
+        mtq_cmd = self._mtq_m_cmd if adcs_powered else np.zeros(3)
+        att.step(dt, tau_gg + tau_res + tau_noise, wheel_cmd, mtq_cmd, b_body)
+        if not np.isfinite(att.omega).all() or not np.isfinite(att.q).all():
+            raise RuntimeError(
+                f"attitude state non-finite at t={t:.0f}s — control loop "
+                "unstable for this timestep or corrupt actuator command")
+
+        # electrical truth (attitude-coupled generation)
+        panel_eci = att.eci_from_body(PANEL_NORMAL_BODY)
+        facing = float(np.dot(panel_eci, sun_hat))
+        p_gen = self.array.generation_w(eclipse, facing)
         if p_gen > 0.0:
             p_gen *= max(0.0, 1.0 + float(self.rng.normal(0.0, 0.02)))
         heater_w = self.loads["bat_heater"] if self.switches["bat_heater"] else 0.0
@@ -85,9 +140,11 @@ class SpacecraftPhysics(Component):
         p_net = p_gen - p_load
 
         # cold-charge inhibit: charging a frozen li-ion pack is forbidden;
-        # blocked charge power is dumped as heat into the structure
+        # blocked charge power is dumped as heat into the structure.
+        # 50 mW threshold so generation noise around p_net = 0 doesn't
+        # toggle the inhibit (and spam events) when gen ~= load
         charge_blocked = (
-            p_net > 0.0 and self.thermal.battery.temp_k < MIN_CHARGE_TEMP_K
+            p_net > 0.05 and self.thermal.battery.temp_k < MIN_CHARGE_TEMP_K
         )
         if charge_blocked != self._charge_blocked:
             self.event("charge_inhibit_on" if charge_blocked else "charge_inhibit_off",
@@ -129,6 +186,23 @@ class SpacecraftPhysics(Component):
         self.publish("sensors/thermal/structure_temp",
                      kelvin=self.thermal.structure.temp_k + float(self.rng.normal(0.0, 0.3)))
 
+        gyro = att.omega + self._gyro_bias + self.rng.normal(0.0, np.deg2rad(0.01), 3)
+        self.publish("sensors/adcs/gyro",
+                     x=float(gyro[0]), y=float(gyro[1]), z=float(gyro[2]))
+        mag = b_body + self.rng.normal(0.0, 1.0e-7, 3)
+        self.publish("sensors/adcs/mag",
+                     x=float(mag[0]), y=float(mag[1]), z=float(mag[2]))
+        sun_body = att.body_from_eci(sun_hat) + self.rng.normal(0.0, 0.017, 3)
+        if eclipse:
+            self.publish("sensors/adcs/sun", x=0.0, y=0.0, z=0.0, valid=False)
+        else:
+            self.publish("sensors/adcs/sun",
+                         x=float(sun_body[0]), y=float(sun_body[1]),
+                         z=float(sun_body[2]), valid=True)
+        h = att.h_wheel
+        self.publish("sensors/adcs/wheel_momentum",
+                     x=float(h[0]), y=float(h[1]), z=float(h[2]))
+
         # ground-truth flight recording (never on the bus)
         every = max(1, round(self._record_every_s / dt))
         if self.clock.tick % every == 0:
@@ -140,3 +214,7 @@ class SpacecraftPhysics(Component):
             self.record("t_batt_k", self.thermal.battery.temp_k)
             self.record("t_struct_k", self.thermal.structure.temp_k)
             self.record("charge_blocked", float(charge_blocked))
+            self.record("rate_dps", float(np.rad2deg(att.rate_rad_s)))
+            self.record("sun_facing", facing)
+            self.record("wheel_h_frac",
+                        float(np.max(np.abs(h)) / att.p.wheel_h_max_nms))

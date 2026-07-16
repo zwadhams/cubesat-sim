@@ -5,3 +5,4 @@ __pycache__/
 runs/
 *.db
 c/obc/obc
+rust/adcs/target/

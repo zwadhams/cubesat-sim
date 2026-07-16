@@ -80,7 +80,16 @@ class RemoteComponent(Component):
 
     def _send(self, obj: dict[str, Any]) -> None:
         try:
-            self._proc.stdin.write(json.dumps(obj, separators=(",", ":")) + "\n")
+            # allow_nan=False: NaN/Infinity are not JSON; sending them once
+            # deadlocked the lockstep when the peer rejected the frame.
+            # A non-finite value here means the physics is sick — fail loud.
+            payload = json.dumps(obj, separators=(",", ":"), allow_nan=False)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.name}: refusing to send non-finite value in frame; "
+                f"upstream state is corrupt: {exc}") from exc
+        try:
+            self._proc.stdin.write(payload + "\n")
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise RuntimeError(

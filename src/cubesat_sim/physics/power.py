@@ -7,14 +7,19 @@ from dataclasses import dataclass
 
 @dataclass
 class SolarArray:
-    """Body-mounted array. Until Phase 3 gives us attitude, `illumination`
-    is an attitude-averaged effectiveness factor in [0, 1]."""
+    """Body-mounted array, dominant panel normal on body +Z. `illumination`
+    is an array-health factor in [0, 1] (deployment damage, degradation).
+    `facing` is the cosine of the sun angle on the main panel; side panels
+    provide the `min_facing` floor when the main panel looks away."""
 
     p_max_w: float = 10.0
     illumination: float = 0.8
+    min_facing: float = 0.15
 
-    def generation_w(self, in_eclipse: bool) -> float:
-        return 0.0 if in_eclipse else self.p_max_w * self.illumination
+    def generation_w(self, in_eclipse: bool, facing: float = 1.0) -> float:
+        if in_eclipse:
+            return 0.0
+        return self.p_max_w * self.illumination * max(self.min_facing, facing)
 
 
 @dataclass

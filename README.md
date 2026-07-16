@@ -39,7 +39,8 @@ Rules of the house:
 - [x] Phase 1 — orbit + power (eclipse cycles breathing through the EPS)
 - [x] Phase 2 — thermal (heater/battery coupling, cold-charge inhibit, death spiral)
 - [x] Phase 2.5 — process bridge + OBC ported to C (bit-identical to reference)
-- [ ] Phase 3 — ADCS (attitude ↔ solar generation coupling)
+- [x] Phase 3 — ADCS in Rust (B-dot detumble, sun pointing, momentum dump;
+      attitude ↔ solar generation coupling; dipole magnetic field)
 - [ ] Phase 4 — data economy (payload, storage, comms windows)
 - [ ] Phase 5 — FDIR, fault injection, degradation, Monte Carlo harness
 
@@ -48,10 +49,13 @@ Rules of the house:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-make -C c/obc          # build the C flight software
+make -C c/obc                                  # C flight software (OBC)
+cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/pytest
-.venv/bin/python examples/phase2_demo.py
+.venv/bin/python examples/phase3_demo.py
 ```
 
 To fly with the C OBC instead of the Python reference:
-`build_sim(obc_impl="c")`.
+`build_sim(obc_impl="c")`. Observed emergent behaviors are cataloged in
+[EMERGENT_BEHAVIORS.md](EMERGENT_BEHAVIORS.md) — the policy is to keep and
+document them unless they break simulation integrity.

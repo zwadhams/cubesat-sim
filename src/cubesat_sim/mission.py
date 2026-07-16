@@ -16,6 +16,7 @@ from cubesat_sim.subsystems.thermal_ctrl import ThermalControl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 C_OBC_BIN = REPO_ROOT / "c" / "obc" / "obc"
+RUST_ADCS_BIN = REPO_ROOT / "rust" / "adcs" / "target" / "release" / "adcs"
 
 
 def build_sim(
@@ -27,7 +28,9 @@ def build_sim(
     illumination: float = 0.8,
     initial_soc: float = 0.85,
     thermal_sun_w: float = 36.0,
+    initial_tumble_dps: float = 4.0,
     obc_impl: str = "python",
+    adcs_impl: str = "rust",
 ) -> Simulation:
     """One CubeSat in a 500 km / 51.6 deg orbit: physics + EPS + OBC + thermal.
 
@@ -42,6 +45,7 @@ def build_sim(
         array=SolarArray(illumination=illumination),
         battery=Battery(soc=initial_soc),
         thermal=ThermalModel(sun_absorbed_w=thermal_sun_w),
+        initial_tumble_dps=initial_tumble_dps,
     ))
     sim.add(EPS())
     if obc_impl == "python":
@@ -51,4 +55,8 @@ def build_sim(
     else:
         raise ValueError(f"unknown obc_impl: {obc_impl!r}")
     sim.add(ThermalControl())
+    if adcs_impl == "rust":
+        sim.add(RemoteComponent("adcs", period=1.0, argv=[str(RUST_ADCS_BIN)]))
+    elif adcs_impl != "none":
+        raise ValueError(f"unknown adcs_impl: {adcs_impl!r}")
     return sim

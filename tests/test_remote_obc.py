@@ -1,19 +1,9 @@
-import shutil
-import subprocess
-
 import pytest
 
 from cubesat_sim import RemoteComponent, Simulation
-from cubesat_sim.mission import C_OBC_BIN, build_sim
+from cubesat_sim.mission import build_sim
 
-
-@pytest.fixture(scope="session")
-def c_obc():
-    if shutil.which("make") is None or shutil.which("cc") is None:
-        pytest.skip("no C toolchain available")
-    subprocess.run(["make", "-C", str(C_OBC_BIN.parent)],
-                   check=True, capture_output=True)
-    return C_OBC_BIN
+pytestmark = pytest.mark.usefixtures("rust_adcs_binary")
 
 
 def flight(obc_impl, **cfg):
@@ -29,7 +19,7 @@ def flight(obc_impl, **cfg):
     return data
 
 
-def test_c_obc_bit_identical_to_python_reference(c_obc):
+def test_c_obc_bit_identical_to_python_reference(c_obc_binary):
     """The whole point of the bridge: swapping flight software language
     must not change the flight. Same seed, same scenario -> identical
     message log, telemetry, and events, across a process boundary and a
@@ -38,7 +28,7 @@ def test_c_obc_bit_identical_to_python_reference(c_obc):
     assert flight("python", illumination=0.45) == flight("c", illumination=0.45)
 
 
-def test_c_obc_flies_healthy_scenario(c_obc):
+def test_c_obc_flies_healthy_scenario(c_obc_binary):
     sim = build_sim(dt=5.0, seed=12, obc_impl="c")
     sim.run(duration=2 * sim.components[0].orbit.period_s)
     assert sim.recorder.events("obc") == []  # stayed NOMINAL

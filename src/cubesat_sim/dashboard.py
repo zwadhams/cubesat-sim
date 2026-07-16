@@ -26,9 +26,14 @@ import argparse
 import json
 import math
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
-from cubesat_sim.environment.orbit import CircularOrbit
+from cubesat_sim.environment.groundstation import gmst_rad
+from cubesat_sim.environment.orbit import R_EARTH, CircularOrbit
+from cubesat_sim.environment.sun import sun_direction_eci
+from cubesat_sim.faults import SAA_LAT_DEG, SAA_LON_DEG
+from cubesat_sim.physics.spacecraft import DEFAULT_STATION, DEFAULT_TARGETS
 
 # analog lanes: (title, unit, fixed y-domain or None, series)
 # each series: (source, key, label, transform)
@@ -246,18 +251,53 @@ def load_flight(db_path: str | Path) -> dict:
                           "value": f"{cap[-1][1]:.2f} Wh",
                           "note": f"array at {illum[-1][1]:.3f}"})
 
+        epoch_iso = json.loads(meta["epoch"]) if "epoch" in meta else None
+
         return {
             "title": db_path.stem,
             "meta": {"seed": meta.get("seed", "?"), "dt": meta.get("dt", "?"),
-                     "epoch": json.loads(meta["epoch"]) if "epoch" in meta else "?",
+                     "epoch": epoch_iso or "?",
                      "duration_s": _round(t_end), "period_s": _round(period)},
             "tiles": tiles,
             "tracks": tracks,
             "events": events,
             "lanes": lanes,
+            "orbit3d": _orbit_geometry(epoch_iso),
         }
     finally:
         db.close()
+
+
+def _orbit_geometry(epoch_iso: str | None) -> dict:
+    """Everything the in-page orbit view needs, in ~300 bytes.
+
+    A circular orbit is exactly `a * (e1 cos(nt) + e2 sin(nt))`, so two
+    basis vectors and the mean motion reconstruct the whole path in JS.
+    Assumes the default mission geometry (orbit, station, targets) — true
+    of every flight build_sim produces today.
+    """
+    orbit = CircularOrbit()
+    a = orbit.semi_major_axis_m
+    e1 = orbit.position_eci(0.0) / a
+    e2 = orbit.position_eci(orbit.period_s / 4.0) / a
+    epoch = (datetime.fromisoformat(epoch_iso) if epoch_iso
+             else datetime(2026, 1, 1, tzinfo=timezone.utc))
+    sun = sun_direction_eci(epoch)
+    sites = [{"name": DEFAULT_STATION.name, "lat": DEFAULT_STATION.lat_deg,
+              "lon": DEFAULT_STATION.lon_deg, "kind": "station"}]
+    sites += [{"name": s.name, "lat": s.lat_deg, "lon": s.lon_deg,
+               "kind": "target"} for s in DEFAULT_TARGETS]
+    return {
+        "r_orbit_re": _round(a / R_EARTH),
+        "n_rad_s": orbit.mean_motion_rad_s,
+        "e1": [_round(v) for v in e1],
+        "e2": [_round(v) for v in e2],
+        "sun": [_round(v) for v in sun],
+        "gmst0_rad": _round(gmst_rad(epoch)),
+        "w_earth_rad_s": math.radians(360.98564736629) / 86400.0,
+        "sites": sites,
+        "saa": {"lat": list(SAA_LAT_DEG), "lon": list(SAA_LON_DEG)},
+    }
 
 
 def render_flight(db_path: str | Path, out_path: str | Path | None = None) -> Path:
@@ -359,6 +399,20 @@ svg .rowlab { font-size: 11px; fill: var(--ink-2); font-variant-numeric: normal;
                 border-top: 2.5px solid; border-radius: 2px; flex: none; }
 #tooltip .v { font-weight: 630; font-variant-numeric: tabular-nums; }
 #tooltip .l { color: var(--ink-2); }
+#orbit canvas { display: block; width: 100%; touch-action: none;
+                border-radius: 6px; cursor: grab; }
+.orbit-controls { display: flex; align-items: center; gap: 10px;
+                  margin-top: 8px; flex-wrap: wrap; }
+.orbit-controls button, .orbit-controls select {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 3px 10px; cursor: pointer;
+}
+.orbit-controls input[type="range"] { flex: 1; min-width: 110px;
+                                      accent-color: var(--s1); }
+.chip { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
+        border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.chip.on { color: var(--ink); border-color: var(--s1); }
 details { margin: 10px 2px; color: var(--ink-2); }
 summary { cursor: pointer; font-size: 12.5px; }
 table { border-collapse: collapse; margin-top: 8px; font-size: 12px; width: 100%; }
@@ -377,6 +431,7 @@ td.num { font-variant-numeric: tabular-nums; }
     <button id="themebtn" type="button">theme: auto</button>
   </header>
   <section class="tiles" id="tiles"></section>
+  <div class="card" id="orbitcard"><h2>Orbit</h2><div id="orbit"></div></div>
   <div class="card"><h2>State channels</h2><div id="tracks"></div></div>
   <div class="card"><h2>Events</h2><div id="events"></div></div>
   <div class="card"><h2>Telemetry</h2><div id="lanes"></div><div id="xaxis"></div></div>
@@ -628,6 +683,296 @@ function drawXAxis() {
   lbl.textContent = "orbits";
 }
 
+/* ---- orbit view: canvas globe + animated satellite ---- */
+function trackOn(label, t) {
+  for (var i = 0; i < DATA.tracks.length; i++) {
+    if (DATA.tracks[i].label !== label) continue;
+    var iv = DATA.tracks[i].intervals;
+    for (var j = 0; j < iv.length; j++)
+      if (t >= iv[j][0] && t <= iv[j][1]) return true;
+    return false;
+  }
+  return false;
+}
+
+function drawOrbitView() {
+  if (window.__orbitStop) window.__orbitStop();
+  var host = document.getElementById("orbit");
+  host.textContent = "";
+  var O = DATA.orbit3d;
+  if (!O) { document.getElementById("orbitcard").style.display = "none"; return; }
+
+  var W = host.clientWidth;
+  var H = Math.max(240, Math.min(420, Math.round(W * 0.52)));
+  var dpr = window.devicePixelRatio || 1;
+  var canvas = document.createElement("canvas");
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  host.appendChild(canvas);
+  var ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+
+  var bar = div("orbit-controls", host);
+  var btn = document.createElement("button"); bar.appendChild(btn);
+  var speedSel = document.createElement("select"); bar.appendChild(speedSel);
+  [60, 300, 1500].forEach(function (v) {
+    var o = document.createElement("option");
+    o.value = v; o.textContent = v + "×";
+    speedSel.appendChild(o);
+  });
+  speedSel.value = "300";
+  var range = document.createElement("input");
+  range.type = "range"; range.min = 0; range.max = T_END;
+  range.step = Math.max(1, T_END / 2000); bar.appendChild(range);
+  var orbChip = div("chip", bar), eclChip = div("chip", bar),
+      conChip = div("chip", bar);
+
+  var reduced = window.matchMedia &&
+      matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var yaw = -0.9, pitch = 0.38, oT = 0, playing = !reduced, last = null,
+      raf = null;
+  var cx = W / 2, cy = H / 2;
+  var s = (Math.min(W, H) / 2 - 8) / 1.32;
+  var PERIOD_O = 2 * Math.PI / O.n_rad_s;
+
+  /* view: Rz(yaw) then Rx(pitch); screen x right, ECI north up,
+     depth d > 0 faces the viewer */
+  function rot(v) {
+    var c = Math.cos(yaw), sn = Math.sin(yaw);
+    var x = v[0] * c - v[1] * sn, y = v[0] * sn + v[1] * c, z = v[2];
+    var cp = Math.cos(pitch), sp = Math.sin(pitch);
+    return [x, y * cp - z * sp, y * sp + z * cp];
+  }
+  function P(v) {
+    var r = rot(v);
+    return { x: cx + r[0] * s, y: cy - r[2] * s, d: -r[1] };
+  }
+  function satPos(t) {
+    var u = O.n_rad_s * t, cu = Math.cos(u), su = Math.sin(u),
+        R = O.r_orbit_re;
+    return [R * (cu * O.e1[0] + su * O.e2[0]),
+            R * (cu * O.e1[1] + su * O.e2[1]),
+            R * (cu * O.e1[2] + su * O.e2[2])];
+  }
+  function siteEci(lat, lon, t) {
+    var la = lat * Math.PI / 180;
+    var lo = lon * Math.PI / 180 + O.gmst0_rad + O.w_earth_rad_s * t;
+    return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
+            Math.sin(la)];
+  }
+  function latLon(lat, lon) {
+    var la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
+    return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
+            Math.sin(la)];
+  }
+  function css(name) {
+    return getComputedStyle(document.documentElement)
+      .getPropertyValue(name).trim();
+  }
+  function occluded(p) {
+    var dx = p.x - cx, dy = p.y - cy;
+    return p.d < 0 && (dx * dx + dy * dy) < (s * 0.998) * (s * 0.998);
+  }
+  function polyline(pts, filter, color, width, alpha) {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    var pen = false;
+    for (var i = 0; i < pts.length; i++) {
+      if (filter(pts[i])) {
+        if (pen) ctx.lineTo(pts[i].x, pts[i].y);
+        else { ctx.moveTo(pts[i].x, pts[i].y); pen = true; }
+      } else pen = false;
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    var grid = css("--grid"), axis = css("--axis"), s1 = css("--s1"),
+        s2 = css("--s2"), s3 = css("--s3"), s4 = css("--s4"),
+        serious = css("--serious"), ink2 = css("--ink-2"),
+        surface = css("--surface");
+    var gmst = O.gmst0_rad + O.w_earth_rad_s * oT;
+    var lonOff = gmst * 180 / Math.PI;
+    function earthPt(lat, lon) { return P(latLon(lat, lon + lonOff)); }
+
+    // graticule rotates with the Earth: back half, disk, front half
+    var lines = [];
+    for (var lon = 0; lon < 180; lon += 30) {
+      var pts = [];
+      for (var a = 0; a <= 360; a += 5) {
+        var la = (a <= 180 ? a - 90 : 270 - a);
+        pts.push(earthPt(la, a <= 180 ? lon : lon + 180));
+      }
+      lines.push(pts);
+    }
+    [-60, -30, 0, 30, 60].forEach(function (lat) {
+      var pts = [];
+      for (var b = 0; b <= 360; b += 5) pts.push(earthPt(lat, b));
+      lines.push(pts);
+    });
+    lines.forEach(function (pts) {
+      polyline(pts, function (p) { return p.d < 0; }, grid, 1, 0.45);
+    });
+    ctx.fillStyle = css("--band");
+    ctx.beginPath(); ctx.arc(cx, cy, s, 0, 2 * Math.PI); ctx.fill();
+    // crude terminator: darken the anti-sun half of the disk
+    var sv = rot(O.sun), sl = Math.hypot(sv[0], sv[2]) || 1;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, s, 0, 2 * Math.PI); ctx.clip();
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.atan2(-sv[2], sv[0]) + Math.PI);
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    ctx.fillRect(0, -s, s, 2 * s);
+    ctx.restore();
+    lines.forEach(function (pts) {
+      polyline(pts, function (p) { return p.d >= 0; }, grid, 1, 0.9);
+    });
+    ctx.strokeStyle = axis; ctx.lineWidth = 1; ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, s, 0, 2 * Math.PI); ctx.stroke();
+
+    // SAA box, on the rotating surface
+    var saa = [];
+    var la0 = O.saa.lat[0], la1 = O.saa.lat[1],
+        lo0 = O.saa.lon[0], lo1 = O.saa.lon[1], k;
+    for (k = lo0; k <= lo1; k += 5) saa.push(earthPt(la1, k));
+    for (k = la1; k >= la0; k -= 5) saa.push(earthPt(k, lo1));
+    for (k = lo1; k >= lo0; k -= 5) saa.push(earthPt(la0, k));
+    for (k = la0; k <= la1; k += 5) saa.push(earthPt(k, lo0));
+    polyline(saa, function (p) { return p.d >= 0; }, serious, 1.4, 0.6);
+    var saaC = earthPt((la0 + la1) / 2, (lo0 + lo1) / 2);
+    if (saaC.d > 0.15) {
+      ctx.fillStyle = serious; ctx.globalAlpha = 0.75;
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText("SAA", saaC.x - 10, saaC.y + 3);
+      ctx.globalAlpha = 1;
+    }
+
+    // orbit ring: dim behind the globe, faded in eclipse
+    var t0ring = Math.floor(oT / PERIOD_O) * PERIOD_O;
+    ctx.lineWidth = 2;
+    for (var i = 0; i < 180; i++) {
+      var ta = t0ring + (i / 180) * PERIOD_O,
+          tb = t0ring + ((i + 1) / 180) * PERIOD_O;
+      var pa = P(satPos(ta)), pb = P(satPos(tb));
+      var hid = occluded(pa) || occluded(pb);
+      var ecl = trackOn("eclipse", (ta + tb) / 2);
+      ctx.strokeStyle = s1;
+      ctx.globalAlpha = hid ? 0.10 : (ecl ? 0.25 : 0.75);
+      ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // ground sites ride the rotation
+    O.sites.forEach(function (site) {
+      var p = P(siteEci(site.lat, site.lon, oT));
+      if (p.d <= 0) return;
+      var stn = site.kind === "station";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, stn ? 4.5 : 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = stn ? s2 : s3; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
+      ctx.fillStyle = ink2; ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText(site.name, p.x + 7, p.y + 3);
+    });
+
+    // trail, then the satellite itself
+    var sp = P(satPos(oT));
+    ctx.lineWidth = 2; ctx.strokeStyle = s1;
+    var TRAIL = Math.min(oT, PERIOD_O * 0.22);
+    for (var j = 0; j < 24; j++) {
+      var u0 = oT - TRAIL * (1 - j / 24), u1 = oT - TRAIL * (1 - (j + 1) / 24);
+      var qa = P(satPos(u0)), qb = P(satPos(u1));
+      if (occluded(qa) || occluded(qb)) continue;
+      ctx.globalAlpha = 0.06 + 0.5 * (j / 24);
+      ctx.beginPath(); ctx.moveTo(qa.x, qa.y); ctx.lineTo(qb.x, qb.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    if (trackOn("ground contact", oT)) {
+      var st = O.sites[0], gp = P(siteEci(st.lat, st.lon, oT));
+      ctx.strokeStyle = s2; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
+      ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(sp.x, sp.y);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    ctx.globalAlpha = occluded(sp) ? 0.35 : 1;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = s1; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // sun direction glyph at the rim
+    var gx = cx + (sv[0] / sl) * s * 1.22, gy = cy - (sv[2] / sl) * s * 1.22;
+    ctx.globalAlpha = -sv[1] >= 0 ? 0.95 : 0.55;
+    ctx.beginPath(); ctx.arc(gx, gy, 6, 0, 2 * Math.PI);
+    ctx.fillStyle = s4; ctx.fill();
+    for (var r = 0; r < 8; r++) {
+      var an = r * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(gx + Math.cos(an) * 8, gy + Math.sin(an) * 8);
+      ctx.lineTo(gx + Math.cos(an) * 11, gy + Math.sin(an) * 11);
+      ctx.strokeStyle = s4; ctx.lineWidth = 1.4; ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    orbChip.textContent = "orbit " + (oT / PERIOD_O).toFixed(2);
+    eclChip.textContent = trackOn("eclipse", oT) ? "eclipse" : "sunlit";
+    eclChip.className = "chip" + (trackOn("eclipse", oT) ? "" : " on");
+    conChip.textContent = trackOn("ground contact", oT)
+      ? "in contact" : "no contact";
+    conChip.className = "chip" + (trackOn("ground contact", oT) ? " on" : "");
+  }
+
+  function frame(ts) {
+    raf = null;
+    if (last === null) last = ts;
+    var dt = (ts - last) / 1000; last = ts;
+    if (playing) {
+      oT += dt * parseFloat(speedSel.value);
+      if (oT > T_END) oT = 0;
+      range.value = oT;
+    }
+    render();
+    if (playing) raf = requestAnimationFrame(frame);
+  }
+  function setPlaying(on) {
+    playing = on; last = null;
+    btn.textContent = on ? "Pause" : "Play";
+    if (on && raf === null) raf = requestAnimationFrame(frame);
+  }
+  btn.addEventListener("click", function () { setPlaying(!playing); });
+  range.addEventListener("input", function () {
+    oT = parseFloat(range.value);
+    if (!playing) render();
+  });
+  speedSel.addEventListener("change", function () { last = null; });
+
+  var dragging = false, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", function (ev) {
+    dragging = true; lx = ev.clientX; ly = ev.clientY;
+    canvas.setPointerCapture(ev.pointerId);
+  });
+  canvas.addEventListener("pointermove", function (ev) {
+    if (!dragging) return;
+    yaw += (ev.clientX - lx) * 0.008;
+    pitch = Math.max(-1.35, Math.min(1.35, pitch + (ev.clientY - ly) * 0.008));
+    lx = ev.clientX; ly = ev.clientY;
+    if (!playing) render();
+  });
+  canvas.addEventListener("pointerup", function () { dragging = false; });
+
+  window.__orbitSeek = function (t) {
+    if (!playing) { oT = t; range.value = t; render(); }
+  };
+  window.__orbitStop = function () {
+    if (raf !== null) cancelAnimationFrame(raf);
+    raf = null; window.__orbitSeek = null;
+  };
+  btn.textContent = playing ? "Pause" : "Play";
+  render();
+  if (playing) raf = requestAnimationFrame(frame);
+}
+
 /* ---- crosshair + tooltip, shared across every chart ---- */
 var tooltip = document.getElementById("tooltip");
 function attachCrosshair(svg, plotW, h, fill) {
@@ -646,6 +991,7 @@ function attachCrosshair(svg, plotW, h, fill) {
     var rows = [];
     fill(rows, t);
     showTooltip(ev, t, rows);
+    if (window.__orbitSeek) window.__orbitSeek(t);  // paused globe follows
   });
   svg.addEventListener("pointerleave", hideCross);
 }
@@ -739,7 +1085,7 @@ themebtn.addEventListener("click", function () {
 function buildAll() {
   charts = [];
   document.getElementById("lanes").textContent = "";
-  drawChips(); drawTiles(); drawTracks(); drawEvents();
+  drawChips(); drawTiles(); drawOrbitView(); drawTracks(); drawEvents();
   DATA.lanes.forEach(drawLane);
   drawXAxis(); drawEventTable();
 }

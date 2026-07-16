@@ -30,6 +30,14 @@ def test_load_flight_extracts_everything(tmp_path):
     # bands/tracks own these; they must not double as markers
     assert "eclipse_enter" not in kinds and "charge_inhibit_on" not in kinds
     assert any(t["label"] == "Min SoC (true)" for t in data["tiles"])
+    # orbit view geometry: orthonormal in-plane basis, sane radius
+    orb = data["orbit3d"]
+    e1, e2 = orb["e1"], orb["e2"]
+    assert abs(sum(a * b for a, b in zip(e1, e2))) < 1e-6
+    assert abs(sum(a * a for a in e1) - 1.0) < 1e-6
+    assert 1.05 < orb["r_orbit_re"] < 1.10  # 500 km over a 6371 km Earth
+    assert orb["sites"][0]["kind"] == "station"
+    assert len(orb["sites"]) == 4
     # every series point is finite JSON (json.dumps would throw on NaN
     # later; check the contract at the source)
     for lane in data["lanes"]:

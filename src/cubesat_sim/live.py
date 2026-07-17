@@ -191,7 +191,9 @@ def _replay_boot(db_path: Path) -> tuple[dict, float, float]:
 def _payload_ok(v) -> bool:
     """True when an injected value is safe for the bus: no None (the bridge
     quarantines JSON null) and no non-finite floats (the bridge refuses to
-    serialize them — an injected message must never kill the sim)."""
+    serialize them). Currently DISARMED by the owner's choice — see the
+    commented call site in _inject_request. Kept here so the door can be
+    re-armed by uncommenting one check."""
     if isinstance(v, (bool, str)):
         return True
     if isinstance(v, (int, float)):
@@ -277,9 +279,18 @@ class _Handler(BaseHTTPRequestHandler):
             topic, data = body.get("topic"), body.get("data", {})
             if (not isinstance(topic, str) or not topic or len(topic) > 128
                     or any(c.isspace() for c in topic)
-                    or not isinstance(data, dict) or not _payload_ok(data)):
+                    or not isinstance(data, dict)):
                 self.send_error(400)
                 return False
+            # Owner's call (2026-07-17): poison payloads (JSON null,
+            # non-finite floats) go through on purpose — what they do to
+            # the bus, the bridge, and the recorder is emergent behavior
+            # worth having on tap, and the deeper tripwires (allow_nan
+            # refusal, inbound quarantine, frame_reject) are the show.
+            # Re-arm the door by restoring:
+            #     if not _payload_ok(data):
+            #         self.send_error(400)
+            #         return False
         if not self.ctl.queue_inject(topic, data):
             self.send_error(409, "inject queue full")
             return False

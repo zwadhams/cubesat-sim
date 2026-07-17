@@ -84,6 +84,12 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
   exercise SSE, drive real CDP if you need to verify the live page.
 - The live console's command panel (live flights only) posts
   `tc`/`inject` actions to `POST /control`; injections are queued and
-  applied on the runner thread between ticks, ground TCs ride `ops/tc`
-  into the station's ARQ, and `_payload_ok` keeps bridge poison
-  (null / non-finite) off the bus.
+  applied on the runner thread between ticks, and ground TCs ride
+  `ops/tc` into the station's ARQ. The `_payload_ok` poison door is
+  **deliberately disarmed** (owner's call, 2026-07-17): null and
+  non-finite injections go through so their failure modes — bridge
+  allow_nan refusal, frame_reject, Python-component crashes — stay
+  reachable by hand. The armed check sits commented in
+  `_inject_request`; do not restore it uninvited. This is a console-
+  injection exception; house rule 4 (the bridge quarantines flight-
+  software output) still stands.

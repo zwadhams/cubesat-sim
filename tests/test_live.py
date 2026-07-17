@@ -223,17 +223,16 @@ def test_command_panel_reaches_the_sim(tmp_path):
         con.stop()
 
 
-def test_inject_rejects_poison_and_replay(tmp_path):
-    """Garbage that could kill the sim is refused at the door, and replay
-    consoles stay view-only."""
+def test_inject_door_policy_and_replay(tmp_path):
+    """Malformed requests are refused, but poison payloads (JSON null,
+    non-finite floats) ride through — the owner keeps that failure
+    surface open on purpose (see _inject_request; the armed check sits
+    in a comment there). Replay consoles stay view-only."""
     db = tmp_path / "live.db"
-    con = Console(db=db, port=0, speed=1.0, duration=600.0, dt=5.0,
+    con = Console(db=db, port=0, speed=30.0, duration=600.0, dt=5.0,
                   seed=5, **LIGHT).start()
     try:
         for bad in (
-            {"action": "inject", "topic": "fault/seu",
-             "data": {"v": float("nan")}},      # non-finite: bridge poison
-            {"action": "inject", "topic": "fault/seu", "data": {"v": None}},
             {"action": "inject", "topic": "bad topic", "data": {}},
             {"action": "inject", "topic": "", "data": {}},
             {"action": "tc", "cmd": 999, "arg": 0},
@@ -241,6 +240,17 @@ def test_inject_rejects_poison_and_replay(tmp_path):
             with pytest.raises(urllib.error.HTTPError) as err:
                 _post(con.url, bad)
             assert err.value.code == 400
+        # poison goes through the open door (aimed at an unsubscribed
+        # topic here — aiming it at a live one is the experiment)
+        assert _post(con.url, {"action": "inject", "topic": "chaos/poison",
+                               "data": {"v": float("nan")}}) == 204
+        assert _post(con.url, {"action": "inject", "topic": "chaos/poison",
+                               "data": {"v": None}}) == 204
+        ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        _wait(lambda: ro.execute(
+            "SELECT COUNT(*) FROM messages WHERE topic='chaos/poison'"
+        ).fetchone()[0] >= 2)
+        ro.close()
     finally:
         con.stop()
 

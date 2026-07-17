@@ -66,6 +66,25 @@ def test_render_is_self_contained_html(tmp_path):
     assert 'src="' not in html and "@import" not in html
 
 
+def test_glossary_covers_what_renders(tmp_path):
+    """The teaching layer must not have holes: every event kind, state
+    channel, and event source that can appear in a report has a
+    plain-language definition riding along in the payload."""
+    from cubesat_sim.dashboard import EVENT_GLOSS, EVENT_SEVERITY
+    # every severity-classified kind is explained
+    assert set(EVENT_SEVERITY) <= set(EVENT_GLOSS)
+
+    data = load_flight(make_recording(tmp_path))
+    assert data["gloss"] and data["evgloss"]
+    kinds = {e["kind"] for e in data["events"]}
+    assert not kinds - set(data["evgloss"]), kinds - set(data["evgloss"])
+    gloss_lc = {k.lower() for k in data["gloss"]}
+    for tr in data["tracks"]:  # "ground contact" resolves via its alias
+        assert tr["label"].lower() in gloss_lc | {"ground contact"}, tr["label"]
+    for s in {e["source"] for e in data["events"]}:
+        assert s in gloss_lc, s
+
+
 def test_downsampling_keeps_spikes():
     from cubesat_sim.dashboard import _downsample
     points = [(float(i), 0.0) for i in range(10000)]

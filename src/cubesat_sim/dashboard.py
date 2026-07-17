@@ -7,6 +7,12 @@ shared crosshair — into a single HTML file with zero external
 dependencies (inline CSS/JS, data embedded as JSON). Open it in any
 browser; light/dark follow the OS with a manual toggle.
 
+The report teaches itself: GLOSSARY terms grow dotted-underline hover
+tooltips wherever they appear (tiles, hints, legends, row labels), the
+event log defines every event kind on hover via EVENT_GLOSS, and the
+primer opens with the system in one minute. The goal is that a reader
+can learn the whole spacecraft without leaving the page.
+
 Usage:
     python -m cubesat_sim.dashboard runs/phase5_hard_failure.db
     python -m cubesat_sim.dashboard runs/mc/*.db        # one report each
@@ -151,6 +157,172 @@ EVENT_SEVERITY = {
     "load_restore": "good",
 }
 
+# One glossary, two uses: rendered as the primer's reference grid, and
+# matched against visible text so every acronym / term of art grows a
+# hover tooltip. Keys are matched case-sensitively when they look like
+# acronyms (any uppercase), case-insensitively otherwise; a trailing
+# "s" is tolerated so "SEUs" and "passes" resolve. Grouped for the grid:
+# subsystems first, then power, attitude, link, radiation, sim.
+GLOSSARY = {
+    "physics": "the truth layer — actual orbit, attitude, battery and "
+               "temperatures; no subsystem sees it directly, only noisy "
+               "sensors",
+    "EPS": "electrical power system — battery, solar array, and the load "
+           "switches (flown in bare-metal-style C)",
+    "OBC": "on-board computer — mode management and FDIR (flown in C)",
+    "ADCS": "attitude determination and control system — gyro, "
+            "magnetometer, sun sensor, wheels, magnetorquers (flown in "
+            "Rust)",
+    "comms": "radio and CCSDS framer with the downlink queue (flown in "
+             "C++)",
+    "payload": "the imaging instrument — fills the data queue when "
+               "capturing over a target",
+    "thermal": "thermal control — a bang-bang battery heater",
+    "ground": "ground station: frame decoder, archive, and the operator "
+              "rules that command the payload",
+    "faults": "the fault injector — scheduled hardware misfortunes plus "
+              "random SEUs, elevated over the SAA",
+    "console": "a human at the live console — manual TCs and fault "
+               "injections, recorded like everything else",
+    "SoC": "state of charge — how full the battery is, 0 to 1",
+    "safe mode": "OBC protective mode: payload off to save power until "
+                 "the SoC estimate recovers",
+    "load shed": "the EPS's own last-ditch veto — non-essential loads "
+                 "(ADCS, heater, payload) forced off at very low "
+                 "estimated SoC",
+    "charge inhibit": "li-ion cells must not charge below 0 °C — in deep "
+                      "cold the battery drains even in full sun",
+    "brownout": "the battery hit empty; everything shuts down until "
+                "sunlight brings it back",
+    "heater request": "thermal control asking the EPS for battery-heater "
+                      "power",
+    "eclipse": "in Earth's shadow — no generation, battery discharging",
+    "li-ion": "lithium-ion battery chemistry — hence the 0 °C cold-charge "
+              "limit",
+    "gyro": "gyroscope — measures body rotation rate; the only one "
+            "aboard, so FDIR can't cross-check it",
+    "magnetometer": "measures Earth's magnetic field direction; drives "
+                    "B-dot detumble",
+    "magnetorquers": "electromagnets pushing against Earth's field — "
+                     "detumble and wheel-momentum dumping",
+    "detumble": "ADCS mode that kills rotation after deployment (B-dot "
+                "law); exits below 0.5 deg/s",
+    "sun-point mode": "ADCS mode steering the solar panel at the sun — "
+                      "where the watts come from",
+    "wheel momentum": "spin stored in the reaction wheels; near "
+                      "saturation they lose control authority and must "
+                      "desaturate",
+    "imaging": "the instrument is capturing — data flowing into the "
+               "onboard queue",
+    "target visible": "an imaging target is in view below the "
+                      "spacecraft",
+    "pass": "the few minutes the satellite is above the ground station's "
+            "horizon — the only time the link exists",
+    "beacon": "the periodic housekeeping TM frame — one packet per "
+              "subsystem, the ground's whole picture of the spacecraft",
+    "TM": "telemetry — downlink transfer frames (sync marker, counters, "
+          "CRC)",
+    "TC": "telecommand — an uplinked command frame, retransmitted until "
+          "the beacon acknowledges it",
+    "ARQ": "automatic repeat request — resend until acknowledged",
+    "CRC": "cyclic redundancy check — the frame checksum; corruption "
+           "fails it and the frame is discarded",
+    "VC0": "virtual channel 0 — housekeeping beacons",
+    "VC1": "virtual channel 1 — bulk science data",
+    "sequence gap": "a jump in the frame counters — the observable proof "
+                    "that frames went missing",
+    "SEU": "single-event upset — a radiation strike flips one bit in a "
+           "sensor word",
+    "SAA": "South Atlantic Anomaly — a radiation hotspot where the SEU "
+           "rate jumps ~25×",
+    "FDIR": "fault detection, isolation, recovery — here, a gyro "
+            "watchdog that power-cycles the ADCS, three attempts max",
+    "latch-up": "a sensor stuck repeating one output word; soft ones "
+                "clear on a power cycle, hard ones are forever",
+    "seed": "the mission's random seed — same seed and dt replays the "
+            "identical flight",
+    "dt": "the simulation timestep in seconds",
+    "epoch": "mission start time (UTC) — sets sun geometry and ground "
+             "tracks",
+}
+
+# Every event kind that can appear in a recording, in plain language.
+# The event log shows these on hover; kinds missing here render without
+# a tooltip (tests keep this honest for kinds the sample flights emit).
+EVENT_GLOSS = {
+    "mode_change": "a mode switch — OBC NOMINAL/SAFE or ADCS "
+                   "detumble/sun-point (detail says which and why)",
+    "load_shed": "EPS forced non-essential loads off — estimated SoC "
+                 "fell below the shed threshold",
+    "load_restore": "EPS re-enabled shed loads — the estimate recovered "
+                    "past the restore threshold",
+    "brownout": "battery hit empty; all loads down until sunlight "
+                "recharges it",
+    "gyro_anomaly": "the OBC watchdog first noticed the gyro misbehaving "
+                    "(exact repeats or impossible rates)",
+    "fdir_adcs_power_cycle": "FDIR's classic first move: cut the ADCS "
+                             "rail to clear a latch-up",
+    "fdir_adcs_repower": "power-cycle dwell over — ADCS rail back on",
+    "fdir_giveup": "FDIR exhausted its three power cycles and stopped "
+                   "trying; the ADCS stays powered, the ground inherits "
+                   "the problem",
+    "seu_corruption": "a radiation bit flip landed in a sensor word",
+    "inject": "a hardware fault was injected — by the campaign script, "
+              "or by hand from the console",
+    "inject_seu": "a random SEU fired (Poisson process, ~25× over the "
+                  "SAA)",
+    "latchup_cleared": "a soft sensor latch-up cleared by the ADCS power "
+                       "cycle",
+    "imaging_start": "payload began capturing over a visible target",
+    "imaging_stop": "capture ended — target out of view or instrument "
+                    "off",
+    "instrument_enable": "the payload instrument switched on (ground "
+                         "command took effect)",
+    "instrument_disable": "the payload instrument switched off (ground "
+                          "command took effect)",
+    "operator_enable_payload": "ground operator rule decided to re-enable "
+                               "the payload and queued the TC",
+    "operator_disable_payload": "ground operator rule vetoed the payload "
+                                "(storage or power) and queued the TC",
+    "operator_manual_tc": "a human queued a TC from the live console's "
+                          "command panel",
+    "uplink_dispatch": "the spacecraft's FARM accepted a TC frame and "
+                       "executed the command",
+    "uplink_acked": "the beacon's acceptance counter advanced — the "
+                    "ground stops retransmitting",
+    "tc_reject": "a TC frame failed CRC or parsing at the spacecraft and "
+                 "was discarded",
+    "tc_duplicate": "an already-accepted TC sequence number arrived "
+                    "again (a retransmission crossed the ack); ignored",
+    "tc_out_of_sequence": "a TC arrived out of order and was refused — "
+                          "FARM accepts strictly in sequence",
+    "vc0_gap": "housekeeping frame counter jumped — beacons were lost in "
+               "the channel",
+    "vc1_gap": "science frame counter jumped — data frames were lost in "
+               "the channel",
+    "frame_reject": "a corrupted or unparseable frame was discarded "
+                    "(ground CRC check, or flight software input guard)",
+    "storage_full": "the onboard data queue is full — new science is "
+                    "being dropped",
+    "storage_recovered": "the queue drained below full; capturing "
+                         "resumes",
+    "desat_start": "wheel momentum near saturation — magnetorquers "
+                   "started dumping it",
+    "desat_stop": "momentum dump complete",
+    "pub_reject": "the bridge quarantined a poison bus message from "
+                  "flight software (null / non-finite)",
+    "telemetry_reject": "the bridge quarantined a poison telemetry value "
+                        "from flight software",
+    "uplink": "a console TC queued into the ground station's ARQ",
+    "publish": "a raw bus message injected from the console",
+    "eclipse_enter": "into Earth's shadow", "eclipse_exit": "back into "
+    "sunlight",
+    "contact_aos": "acquisition of signal — pass begins",
+    "contact_los": "loss of signal — pass ends",
+    "charge_inhibit_on": "battery below 0 °C — charging blocked",
+    "charge_inhibit_off": "battery warm enough to charge again",
+}
+
 MAX_BUCKETS = 600
 
 
@@ -273,10 +445,11 @@ def load_flight(db_path: str | Path) -> dict:
              "value": f"{min(v for _, v in soc):.2f}" if soc else "—",
              "note": f"ends {soc[-1][1]:.2f}" if soc else ""},
             {"label": "Brownouts", "value": str(n_brownouts),
-             "note": "battery hit empty" if n_brownouts else "never browned out"},
+             "note": "battery hit empty" if n_brownouts else "never browned out",
+             "warn": n_brownouts > 0},
             {"label": "Safe-mode entries", "value": str(n_safe), "note": ""},
             {"label": "FDIR power cycles", "value": str(n_cycles),
-             "note": "gave up" if gave_up else ""},
+             "note": "gave up" if gave_up else "", "warn": gave_up},
             {"label": "Faults injected", "value": str(n_faults),
              "note": f"+ {n_seus} SEUs" if n_seus else ""},
         ]
@@ -284,7 +457,8 @@ def load_flight(db_path: str | Path) -> dict:
             tiles.append({"label": "Data archived",
                           "value": f"{archive[-1][1]:.0f} MB",
                           "note": (f"{dropped[-1][1]:.0f} MB dropped"
-                                   if dropped and dropped[-1][1] > 0 else "")})
+                                   if dropped and dropped[-1][1] > 0 else ""),
+                          "warn": bool(dropped and dropped[-1][1] > 0)})
         if cap and illum:
             tiles.append({"label": "Degradation",
                           "value": f"{cap[-1][1]:.2f} Wh",
@@ -302,6 +476,8 @@ def load_flight(db_path: str | Path) -> dict:
             "events": events,
             "lanes": lanes,
             "orbit3d": _orbit_geometry(epoch_iso),
+            "gloss": GLOSSARY,
+            "evgloss": EVENT_GLOSS,
         }
     finally:
         db.close()
@@ -412,6 +588,7 @@ header button {
         border-radius: 10px; padding: 10px 12px 9px; }
 .tile .lb { font-size: 12px; color: var(--ink-2); }
 .tile .vl { font-size: 23px; font-weight: 600; margin-top: 1px; }
+.tile .vl.warn { color: var(--serious); }
 .tile .nt { font-size: 11.5px; color: var(--muted); margin-top: 1px; min-height: 15px; }
 .card { background: var(--surface); border: 1px solid var(--border);
         border-radius: 10px; padding: 12px 14px 10px; margin-bottom: 12px; }
@@ -484,6 +661,19 @@ th, td { padding: 3px 10px 3px 0; border-bottom: 1px solid var(--grid); }
 td.num { font-variant-numeric: tabular-nums; }
 .sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
        margin-right: 6px; vertical-align: baseline; }
+/* glossary terms: dotted underline, definition on hover/tap */
+.term { text-decoration: underline dotted var(--muted);
+        text-underline-offset: 2.5px; cursor: help; }
+svg text.hasdef { text-decoration: underline dotted; cursor: help; }
+#tooltip .tt-d { color: var(--ink-2); max-width: 300px; }
+#tooltip .tt-d b { color: var(--ink); }
+/* event-log severity filter chips */
+.evchips { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.evchip { font-size: 11.5px; color: var(--muted); border: 1px solid
+          var(--border); border-radius: 999px; padding: 2px 9px;
+          cursor: pointer; white-space: nowrap; user-select: none; }
+.evchip.on { color: var(--ink); border-color: var(--s1); }
+.evchip .sev { margin-right: 5px; }
 </style>
 </head>
 <body>
@@ -495,6 +685,18 @@ td.num { font-variant-numeric: tabular-nums; }
   </header>
   <details class="intro">
     <summary>How to read this report</summary>
+    <p><strong>The spacecraft in one minute.</strong> The physics layer
+      holds the truth — orbit, attitude, battery, temperatures. No
+      subsystem sees it: they read noisy sensors and one-tick-stale bus
+      traffic, and each pursues its own local objective. The EPS
+      protects the battery (load shed), the OBC protects the mission
+      (safe mode, FDIR), the ADCS points the panel at the sun (that's
+      where the watts come from), thermal keeps the battery warm enough
+      to charge, the payload fills the data queue, and the ground —
+      seeing only what a pass lets through — commands the payload from
+      hours-stale telemetry. Every protection is locally sensible;
+      everything interesting in this report is what happens when they
+      interact.</p>
     <ul>
       <li><strong>Top to bottom:</strong> headline numbers, the orbit
         replay, on/off state channels, discrete events, then continuous
@@ -515,38 +717,28 @@ td.num { font-variant-numeric: tabular-nums; }
         warning</strong>, <strong>● recovery/good</strong>, ○ neutral.
         The full list with details is in the event log below.</li>
     </ul>
-    <div class="gloss">
-      <b>SoC</b><span>state of charge — battery fill fraction, 0 to 1</span>
-      <b>pass</b><span>the few minutes the satellite is above the ground
-        station's horizon</span>
-      <b>safe mode</b><span>OBC protective mode: payload off to save
-        power</span>
-      <b>load shed</b><span>EPS's own last-ditch veto: non-essential
-        loads forced off at very low SoC</span>
-      <b>charge inhibit</b><span>li-ion cells must not charge below
-        0 °C, even in full sun</span>
-      <b>FDIR</b><span>fault detection, isolation, recovery — here, a
-        gyro watchdog that power-cycles the ADCS</span>
-      <b>SAA</b><span>South Atlantic Anomaly: a radiation hotspot where
-        bit-flip (SEU) rates jump ~25×</span>
-      <b>VC0 / VC1</b><span>virtual channels on the radio link:
-        housekeeping beacons / bulk science data</span>
-      <b>CRC reject</b><span>a frame corrupted by channel noise, caught
-        by its checksum and discarded</span>
-      <b>sequence gap</b><span>a jump in the frame counters — proof
-        that frames went missing</span>
-    </div>
+    <p style="margin:2px 0 6px">Dotted-underlined terms anywhere in the
+      report show their definition on hover (tap on a phone); event
+      names in the log do the same. The full glossary:</p>
+    <div class="gloss" id="gloss"></div>
   </details>
   <section class="tiles" id="tiles"></section>
   <div class="card" id="orbitcard"><h2>Orbit</h2><div id="orbit"></div></div>
   <div class="card"><h2>State channels</h2><div id="xaxis-top"></div>
     <div id="tracks"></div></div>
-  <div class="card"><h2>Events</h2><div id="events"></div></div>
+  <div class="card">
+    <div class="card-head"><h2>Events</h2>
+      <span class="zinfo" id="evcount"></span></div>
+    <div id="events"></div></div>
   <div class="card">
     <div class="card-head"><h2>Telemetry</h2><span class="zinfo" id="zinfo"></span>
       <button id="zoomreset" type="button" hidden>reset zoom</button></div>
     <div id="lanes"></div><div id="xaxis"></div></div>
-  <div class="card"><h2>Event log</h2><div id="evtable"></div></div>
+  <div class="card">
+    <div class="card-head"><h2>Event log</h2>
+      <span class="zinfo">hover an event name for what it means</span>
+      <span class="evchips" id="evchips"></span></div>
+    <div id="evtable"></div></div>
 </div>
 <div id="tooltip"></div>
 <script type="application/json" id="flight-data">__FLIGHT_JSON__</script>
@@ -612,6 +804,122 @@ function fitText(node, maxW) {
   }
 }
 
+/* ---- glossary: every term of art teaches itself on hover ----
+   One dictionary (DATA.gloss) feeds the primer grid, inline .term spans
+   wrapped around matches in visible text, and the row labels of the
+   state strip / event timeline. Event kinds get their own dictionary
+   (DATA.evgloss) in the event log. */
+var GLOSS = DATA.gloss || {}, EVGLOSS = DATA.evgloss || {};
+var ALIAS = { "ground contact": "pass" };
+var GLOSS_LC = {};
+function normTerm(s) { return String(s).toLowerCase().replace(/-/g, " "); }
+Object.keys(GLOSS).forEach(function (k) { GLOSS_LC[normTerm(k)] = k; });
+function defFor(name) {
+  var lc = normTerm(name);
+  if (ALIAS[lc]) lc = normTerm(ALIAS[lc]);
+  var k = GLOSS_LC[lc];
+  return k ? { name: k, def: GLOSS[k] } : null;
+}
+function termRegex(keys, flags) {
+  keys = keys.slice().sort(function (a, b) { return b.length - a.length; });
+  var alts = keys.map(function (k) {
+    return k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[ -]/g, "[ -]");
+  });
+  // leading boundary is a captured group (no lookbehind for reach);
+  // an optional trailing "s"/"es" lets "SEUs" and "passes" resolve
+  return new RegExp("(^|[^A-Za-z0-9_-])(" + alts.join("|") +
+                    ")((?:es|s)?)(?![A-Za-z0-9_-])", flags);
+}
+var _acr = [], _phr = [];
+Object.keys(GLOSS).forEach(function (k) {
+  (/[A-Z]/.test(k) ? _acr : _phr).push(k);
+});
+var reACR = _acr.length ? termRegex(_acr, "") : null;      // case matters
+var rePHR = _phr.length ? termRegex(_phr, "i") : null;     // it doesn't
+
+function glossifyNode(textNode) {
+  var s = textNode.nodeValue, out = [], pos = 0, hits = 0;
+  while (pos < s.length) {
+    var rest = s.slice(pos), bm = null, bat = Infinity;
+    [reACR, rePHR].forEach(function (re) {
+      if (!re) return;
+      var m = rest.match(re);
+      if (m && m.index + m[1].length < bat) {
+        bat = m.index + m[1].length; bm = m;
+      }
+    });
+    if (!bm) break;
+    var start = pos + bat, len = bm[2].length + bm[3].length;
+    var d = defFor(bm[2]);
+    if (d) {
+      out.push(s.slice(pos, start));
+      out.push({ text: s.slice(start, start + len), d: d });
+      hits++;
+    } else {
+      out.push(s.slice(pos, start + len));
+    }
+    pos = start + len;
+  }
+  if (!hits) return;
+  out.push(s.slice(pos));
+  var frag = document.createDocumentFragment();
+  out.forEach(function (o) {
+    if (typeof o === "string") {
+      if (o) frag.appendChild(document.createTextNode(o));
+      return;
+    }
+    var sp = document.createElement("span");
+    sp.className = "term"; sp.textContent = o.text;
+    sp.dataset.name = o.d.name; sp.dataset.def = o.d.def;
+    frag.appendChild(sp);
+  });
+  textNode.parentNode.replaceChild(frag, textNode);
+}
+function glossify(root) {
+  if (!root) return;
+  var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  var nodes = [];
+  while (walker.nextNode()) {
+    var p = walker.currentNode.parentNode;
+    if (p.closest && p.closest(".term,.gloss,.evkind,script,style")) continue;
+    nodes.push(walker.currentNode);
+  }
+  nodes.forEach(glossifyNode);
+}
+var termActive = false;
+function showTermTip(ev, name, def) {
+  tooltip.textContent = "";
+  div("tt-t", tooltip).textContent = name;
+  div("tt-d", tooltip).textContent = def;
+  tooltip.style.display = "block";
+  placeTip(ev);
+}
+document.addEventListener("mouseover", function (ev) {
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
+});
+document.addEventListener("mouseout", function (ev) {
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = false; tooltip.style.display = "none"; }
+});
+document.addEventListener("click", function (ev) {  // touch: tap toggles
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
+  else if (termActive) { termActive = false; tooltip.style.display = "none"; }
+});
+/* SVG row labels can't hold .term spans; give the whole label a hover */
+function svgDef(node, label) {
+  var d = defFor(label);
+  if (!d) return;
+  node.classList.add("hasdef");
+  node.addEventListener("pointerenter", function (ev) {
+    termActive = true; showTermTip(ev, d.name, d.def);
+  });
+  node.addEventListener("pointerleave", function () {
+    termActive = false; tooltip.style.display = "none";
+  });
+}
+
 /* context shading behind every plot area: gray = eclipse, blue = the
    minutes of ground-station contact — the only time the link exists */
 function drawBands(svg, plotW, h) {
@@ -657,6 +965,7 @@ function drawTracks() {
                          "class": "rowlab" }, svg);
     t.textContent = tr.label + " ×" + tr.intervals.length;
     fitText(t, PADL - 12);
+    svgDef(t, tr.label);
     tr.intervals.forEach(function (iv) {
       if (iv[1] < VIEW.t0 || iv[0] > VIEW.t1) return;
       var x0 = Math.max(PADL, xOf(iv[0], plotW));
@@ -714,6 +1023,7 @@ function drawEvents() {
                          "class": "rowlab" }, svg);
     t.textContent = s;
     fitText(t, PADL - 12);
+    svgDef(t, s);
   });
   DATA.events.forEach(function (e) {
     if (e.t < VIEW.t0 || e.t > VIEW.t1) return;
@@ -1207,7 +1517,14 @@ function attachCrosshair(svg, plotW, h, fill) {
 }
 function hideCross() {
   charts.forEach(function (c) { c.line.setAttribute("visibility", "hidden"); });
-  tooltip.style.display = "none";
+  if (!termActive) tooltip.style.display = "none";
+}
+function placeTip(ev) {
+  var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+  var x = ev.clientX + 14, y = ev.clientY + 12;
+  if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
+  if (y + th > window.innerHeight - 8) y = ev.clientY - th - 12;
+  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
 }
 function showTooltip(ev, t, rows) {
   tooltip.textContent = "";
@@ -1228,11 +1545,7 @@ function showTooltip(ev, t, rows) {
     row.appendChild(v); row.appendChild(l);
   });
   tooltip.style.display = "block";
-  var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
-  var x = ev.clientX + 14, y = ev.clientY + 12;
-  if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
-  if (y + th > window.innerHeight - 8) y = ev.clientY - th - 12;
-  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
+  placeTip(ev);
 }
 
 /* ---- header, tiles, event table ---- */
@@ -1247,14 +1560,23 @@ function drawTiles() {
   DATA.tiles.forEach(function (t) {
     var tile = div("tile", host);
     div("lb", tile).textContent = t.label;
-    div("vl", tile).textContent = t.value;
+    div(t.warn ? "vl warn" : "vl", tile).textContent = t.value;
     div("nt", tile).textContent = t.note || "";
   });
+  glossify(host);
 }
+var EVFILTER = { critical: true, warning: true, good: true, neutral: true };
 function drawEventTable() {
   var host = document.getElementById("evtable");
   host.textContent = "";
   if (!DATA.events.length) { host.textContent = "no events"; return; }
+  var shown = DATA.events.filter(function (e) {
+    return EVFILTER[e.severity];
+  });
+  if (!shown.length) {
+    host.textContent = "no events match the severity filter";
+    return;
+  }
   var table = document.createElement("table");
   var tr = document.createElement("tr");
   ["orbit", "t (s)", "source", "event", "detail"].forEach(function (h) {
@@ -1262,7 +1584,7 @@ function drawEventTable() {
     tr.appendChild(th);
   });
   table.appendChild(tr);
-  DATA.events.forEach(function (e) {
+  shown.forEach(function (e) {
     var row = document.createElement("tr");
     function td(txt, num) {
       var c = document.createElement("td");
@@ -1271,16 +1593,31 @@ function drawEventTable() {
     }
     td(orbits(e.t).toFixed(2), true);
     td(String(Math.round(e.t)), true);
-    td(e.source);
+    var sc = td("", false);
+    var sd = defFor(e.source);
+    if (sd) {
+      var ss = document.createElement("span");
+      ss.className = "term"; ss.textContent = e.source;
+      ss.dataset.name = sd.name; ss.dataset.def = sd.def;
+      sc.appendChild(ss);
+    } else sc.textContent = e.source;
     var kc = td("", false);
+    kc.className = "evkind";
     var dot = document.createElement("span");
     dot.className = "sev"; dot.style.background = SEV[e.severity];
     kc.appendChild(dot);
-    kc.appendChild(document.createTextNode(e.kind));
+    var kn = document.createElement("span");
+    kn.textContent = e.kind;
+    if (EVGLOSS[e.kind]) {
+      kn.className = "term";
+      kn.dataset.name = e.kind; kn.dataset.def = EVGLOSS[e.kind];
+    }
+    kc.appendChild(kn);
     td(e.detail);
     table.appendChild(row);
   });
   host.appendChild(table);
+  glossify(table);
 }
 
 /* ---- theme toggle ---- */
@@ -1322,7 +1659,41 @@ function buildAll() {
   });
   drawXAxis("xaxis-top"); drawXAxis("xaxis");
   drawEventTable(); updateZoomUI();
+  glossify(document.getElementById("lanes"));
+  glossify(document.getElementById("chips"));
 }
+/* one-time teaching chrome: the glossary grid, the primer text, the
+   event count and severity-filter chips */
+(function () {
+  var grid = document.getElementById("gloss");
+  Object.keys(GLOSS).forEach(function (k) {
+    var b = document.createElement("b"); b.textContent = k;
+    var sp = document.createElement("span"); sp.textContent = GLOSS[k];
+    grid.appendChild(b); grid.appendChild(sp);
+  });
+  glossify(document.querySelector(".intro"));
+  var counts = { critical: 0, warning: 0, good: 0, neutral: 0 };
+  DATA.events.forEach(function (e) { counts[e.severity] += 1; });
+  document.getElementById("evcount").textContent =
+    DATA.events.length + " events" +
+    (counts.critical ? " · " + counts.critical + " critical" : "");
+  var chips = document.getElementById("evchips");
+  ["critical", "warning", "good", "neutral"].forEach(function (sev) {
+    if (!counts[sev]) return;
+    var c = document.createElement("span");
+    c.className = "evchip on";
+    var dot = document.createElement("span");
+    dot.className = "sev"; dot.style.background = SEV[sev];
+    c.appendChild(dot);
+    c.appendChild(document.createTextNode(sev + " " + counts[sev]));
+    c.addEventListener("click", function () {
+      EVFILTER[sev] = !EVFILTER[sev];
+      c.className = "evchip" + (EVFILTER[sev] ? " on" : "");
+      drawEventTable();
+    });
+    chips.appendChild(c);
+  });
+})();
 document.getElementById("zoomreset").addEventListener("click", resetView);
 var resizeTimer = null;
 window.addEventListener("resize", function () {

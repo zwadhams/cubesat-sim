@@ -13,6 +13,12 @@ loop: commands go up as CRC'd, sequence-numbered TC frames, retransmitted
 until the beacon's acceptance counter (tc_ack) shows the spacecraft's
 FARM took them. Every decision still acts on stale data with hours of
 actuation delay; now the retries are visible protocol, not blind faith.
+
+A human operator sits beside the rule: `ops/tc {cmd, arg}` bus messages
+(from the live console's command panel) queue a manual TC into the same
+ARQ pipeline. The automatic vetoes keep running — a manual enable during
+a power emergency will be overridden a step later, and that argument
+between human and rule is visible in the event log.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ class GroundStation(Component):
 
     def on_start(self) -> None:
         self.subscribe("radio/rx_ground")
+        self.subscribe("ops/tc")
 
     # -- frame handling -------------------------------------------------------
 
@@ -111,6 +118,9 @@ class GroundStation(Component):
 
     def step(self, t: float, dt: float) -> None:
         for msg in self.drain():
+            if msg.topic == "ops/tc":
+                self._manual_tc(msg.data)
+                continue
             kind = msg.data.get("kind")
             if kind == "tm_frame":
                 self._handle_tm_frame(msg.data["hex"])
@@ -181,6 +191,17 @@ class GroundStation(Component):
             self.record("sat_safe_mode", float(self.sat_safe_mode))
         if self.sat_shedding is not None:
             self.record("sat_shedding", float(self.sat_shedding))
+
+    def _manual_tc(self, data: dict) -> None:
+        """A human at the console: queue their TC through the same ARQ as
+        the rule's. desired_enable tracks the operator's last word so the
+        rule doesn't re-send what the human just sent — though its vetoes
+        still get the final say on the next step."""
+        cmd, arg = int(data["cmd"]), int(data["arg"])
+        self._queue_command(cmd, arg)
+        if cmd == ccsds.CMD_PAYLOAD_ENABLE:
+            self.desired_enable = bool(arg)
+        self.event("operator_manual_tc", cmd=cmd, arg=arg)
 
     def _queue_command(self, cmd_id: int, arg: int) -> None:
         self._pending = (self._tc_seq, cmd_id, arg)

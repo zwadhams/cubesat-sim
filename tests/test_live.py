@@ -14,6 +14,8 @@ import urllib.request
 
 import pytest
 
+from cubesat_sim import Simulation, ccsds
+from cubesat_sim.ground.station import GroundStation
 from cubesat_sim.live import Console
 from cubesat_sim.mission import build_sim
 
@@ -157,3 +159,95 @@ def test_replay_streams_whole_recording(tmp_path):
         assert times == sorted(times)
     finally:
         con.stop()
+
+
+def test_ops_tc_queues_a_real_frame():
+    """The command panel's ground-station hook: an ops/tc bus message
+    becomes a CRC'd TC frame in the ARQ pipeline, and the operator's
+    payload model tracks the manual command."""
+    sim = Simulation(dt=1.0, seed=0)
+    gs = sim.add(GroundStation())
+    sim.bus.publish("ops/tc", "console",
+                    {"cmd": ccsds.CMD_PAYLOAD_ENABLE, "arg": 0})
+    sim.run(ticks=3)
+
+    txs = sim.recorder.messages(topic="ground/tx")
+    assert txs, "manual TC never transmitted"
+    parsed = ccsds.parse_tc_frame(bytes.fromhex(json.loads(txs[0][5])["hex"]))
+    assert parsed["crc_ok"]
+    assert parsed["cmd_id"] == ccsds.CMD_PAYLOAD_ENABLE and parsed["arg"] == 0
+    assert gs.desired_enable is False
+    assert any(e[3] == "operator_manual_tc"
+               for e in sim.recorder.events("ground"))
+    sim.close()
+
+
+def test_command_panel_reaches_the_sim(tmp_path):
+    """POST tc / inject land on the bus between ticks: the fault message
+    (sender console) and the uplinked TC frame show up in the recording,
+    with console events beside them."""
+    db = tmp_path / "live.db"
+    con = Console(db=db, port=0, speed=60.0, duration=3000.0, dt=5.0,
+                  seed=4, **LIGHT).start()
+    try:
+        _wait(lambda: con.ctl.tick >= 1)
+        assert _post(con.url, {"action": "inject", "topic": "fault/array_hit",
+                               "data": {"mult": 0.7}}) == 204
+        assert _post(con.url, {"action": "tc", "cmd": 1, "arg": 0}) == 204
+
+        ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+
+        def landed():
+            n = ro.execute(
+                "SELECT COUNT(*) FROM messages WHERE topic='fault/array_hit' "
+                "AND sender='console'").fetchone()[0]
+            m = ro.execute(
+                "SELECT COUNT(*) FROM messages WHERE topic='ground/tx'"
+            ).fetchone()[0]
+            return n > 0 and m > 0
+
+        _wait(landed)
+        hexstr = json.loads(ro.execute(
+            "SELECT data FROM messages WHERE topic='ground/tx' "
+            "ORDER BY rowid LIMIT 1").fetchone()[0])["hex"]
+        parsed = ccsds.parse_tc_frame(bytes.fromhex(hexstr))
+        assert parsed["crc_ok"] and parsed["arg"] == 0
+        kinds = {row[0] for row in ro.execute(
+            "SELECT kind FROM events WHERE source='console'")}
+        assert kinds == {"inject", "uplink"}
+        assert ro.execute(
+            "SELECT COUNT(*) FROM events WHERE source='ground' "
+            "AND kind='operator_manual_tc'").fetchone()[0] > 0
+        ro.close()
+    finally:
+        con.stop()
+
+
+def test_inject_rejects_poison_and_replay(tmp_path):
+    """Garbage that could kill the sim is refused at the door, and replay
+    consoles stay view-only."""
+    db = tmp_path / "live.db"
+    con = Console(db=db, port=0, speed=1.0, duration=600.0, dt=5.0,
+                  seed=5, **LIGHT).start()
+    try:
+        for bad in (
+            {"action": "inject", "topic": "fault/seu",
+             "data": {"v": float("nan")}},      # non-finite: bridge poison
+            {"action": "inject", "topic": "fault/seu", "data": {"v": None}},
+            {"action": "inject", "topic": "bad topic", "data": {}},
+            {"action": "inject", "topic": "", "data": {}},
+            {"action": "tc", "cmd": 999, "arg": 0},
+        ):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                _post(con.url, bad)
+            assert err.value.code == 400
+    finally:
+        con.stop()
+
+    replay = Console(replay=db, port=0, speed=math.inf).start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _post(replay.url, {"action": "tc", "cmd": 1, "arg": 1})
+        assert err.value.code == 409
+    finally:
+        replay.stop()

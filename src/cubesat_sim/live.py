@@ -6,8 +6,13 @@ runs the mission one tick at a time, paced to wall clock, and a small
 stdlib HTTP server tails the recording, pushing new rows to the browser
 over Server-Sent Events. The page is an ops console: mission clock, orbit
 globe, live telemetry lanes, the raw spacecraft bus, the decoded space
-link, and an event ticker. View-only by design — pause and time
-acceleration are the only controls; the mission flies itself.
+link, an event ticker — and, on live flights, a command panel: queue a
+real TC through the ground station's ARQ, inject a hardware fault, or
+publish a raw bus message mid-flight. Injections are applied between
+ticks on the runner thread and recorded like all other traffic, so the
+recording stays the complete, replayable record of the flight (though
+(seed, dt) alone no longer reproduces a manually-commanded one). Replays
+stay view-only.
 
 Because the server only ever tails a recording, `--replay` can "fly" any
 finished flight (a Monte Carlo campaign recording, say) at any speed.
@@ -59,11 +64,27 @@ class LiveControl:
     tick: int = 0
     done: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _inject: list = field(default_factory=list, repr=False)
 
     def set(self, **kw) -> None:
         with self._lock:
             for k, v in kw.items():
                 setattr(self, k, v)
+
+    def queue_inject(self, topic: str, data: dict) -> bool:
+        """Queue a bus publish for the runner thread; the bus and recorder
+        are never touched from HTTP threads. False if the queue is full
+        (a paused mission accumulating spam)."""
+        with self._lock:
+            if len(self._inject) >= 256:
+                return False
+            self._inject.append((topic, data))
+            return True
+
+    def take_injects(self) -> list:
+        with self._lock:
+            out, self._inject = self._inject, []
+            return out
 
     def status(self) -> dict:
         with self._lock:
@@ -83,6 +104,13 @@ def fly(sim, ctl: LiveControl, duration_s: float) -> None:
                 _time.sleep(0.05)
             if ctl.stop:
                 break
+            for topic, data in ctl.take_injects():
+                sim.bus.publish(topic, "console", data)
+                kind = ("inject" if topic.startswith("fault/")
+                        else "uplink" if topic == "ops/tc" else "publish")
+                sim.recorder.log_event(sim.clock.tick, sim.clock.time,
+                                       "console", kind,
+                                       {"topic": topic, **data})
             sim.run(ticks=1)
             ctl.set(sim_time=sim.clock.time, tick=sim.clock.tick)
             # pace: chunked wait so pause and speed changes bite within ~100 ms
@@ -160,11 +188,27 @@ def _replay_boot(db_path: Path) -> tuple[dict, float, float]:
     return boot, t_end, dt
 
 
+def _payload_ok(v) -> bool:
+    """True when an injected value is safe for the bus: no None (the bridge
+    quarantines JSON null) and no non-finite floats (the bridge refuses to
+    serialize them — an injected message must never kill the sim)."""
+    if isinstance(v, (bool, str)):
+        return True
+    if isinstance(v, (int, float)):
+        return math.isfinite(v)
+    if isinstance(v, dict):
+        return all(isinstance(k, str) and _payload_ok(x) for k, x in v.items())
+    if isinstance(v, list):
+        return all(_payload_ok(x) for x in v)
+    return False
+
+
 class _Handler(BaseHTTPRequestHandler):
     # injected by Console via a per-instance subclass:
     ctl: LiveControl
     db_path: str
     page: bytes
+    live: bool  # False in replay mode: the console is view-only there
 
     def log_message(self, fmt, *args):  # keep the terminal quiet
         pass
@@ -204,11 +248,42 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if math.isfinite(v) and v > 0:
                 self.ctl.set(speed=min(max(v, 0.1), 10000.0))
+        elif action in ("tc", "inject"):
+            if not self._inject_request(action, body):
+                return
         else:
             self.send_error(400)
             return
         self.send_response(204)
         self.end_headers()
+
+    def _inject_request(self, action: str, body: dict) -> bool:
+        """Validate and queue a command-panel request; on failure send the
+        error response and return False."""
+        if not self.live or self.ctl.status()["done"]:
+            self.send_error(409, "mission is not flying")
+            return False
+        if action == "tc":
+            try:
+                cmd, arg = int(body["cmd"]), int(body["arg"])
+            except (KeyError, TypeError, ValueError):
+                self.send_error(400)
+                return False
+            if not (0 <= cmd <= 255 and 0 <= arg <= 255):
+                self.send_error(400)
+                return False
+            topic, data = "ops/tc", {"cmd": cmd, "arg": arg}
+        else:
+            topic, data = body.get("topic"), body.get("data", {})
+            if (not isinstance(topic, str) or not topic or len(topic) > 128
+                    or any(c.isspace() for c in topic)
+                    or not isinstance(data, dict) or not _payload_ok(data)):
+                self.send_error(400)
+                return False
+        if not self.ctl.queue_inject(topic, data):
+            self.send_error(409, "inject queue full")
+            return False
+        return True
 
     # -- the tail ------------------------------------------------------------
 
@@ -337,7 +412,8 @@ class Console:
         page = (_PAGE.replace("__TITLE__", boot["title"])
                 .replace("__BOOT__", blob)).encode()
         handler = type("BoundHandler", (_Handler,), {
-            "ctl": self.ctl, "db_path": str(self.db_path), "page": page})
+            "ctl": self.ctl, "db_path": str(self.db_path), "page": page,
+            "live": self.sim is not None})
         self.server = ThreadingHTTPServer((host, port), handler)
         self._server_thread = threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.2},
@@ -569,6 +645,31 @@ tr.pinned td { background: var(--bandc); }
   background: var(--page); border: 1px solid var(--border);
   border-radius: 7px; padding: 3px 10px; margin-left: auto; width: 220px;
 }
+.cmdrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+          margin: 7px 0; }
+.cmdrow .cl { font-size: 11.5px; color: var(--muted); width: 56px;
+              flex: none; }
+.cmdrow .hint { font-size: 11.5px; color: var(--muted); }
+.cmdrow button {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 4px 12px; cursor: pointer;
+}
+.cmdrow select, .cmdrow input[type="number"], .cmdrow label {
+  font: inherit; font-size: 12.5px; color: var(--ink);
+}
+.cmdrow select, .cmdrow input[type="number"] {
+  background: var(--page); border: 1px solid var(--border);
+  border-radius: 7px; padding: 3px 8px;
+}
+.cmdrow input[type="number"] { width: 90px; }
+.cmdrow input[type="text"] { margin-left: 0; width: 200px; }
+.cmdrow input[type="text"].grow { flex: 1; min-width: 180px; width: auto; }
+.cmdrow label { color: var(--ink-2); display: inline-flex;
+                align-items: center; gap: 4px; }
+.cmdnote { font-size: 11.5px; color: var(--muted); margin-top: 6px;
+           min-height: 15px; }
+.cmdnote.bad { color: var(--critical); }
 .card-head { display: flex; align-items: baseline; gap: 10px;
              margin-bottom: 8px; flex-wrap: wrap; }
 .card-head h2 { margin: 0; }
@@ -661,6 +762,30 @@ summary { cursor: pointer; font-size: 12.5px; }
     <h2>Space link <span class="zinfo">decoded frames, ground &#8596; sat
       (&#8595; telemetry down, &#8593; commands up)</span></h2>
     <div class="feed mono" id="link"></div>
+  </div>
+
+  <div class="card" id="cmdpanel" style="display:none">
+    <h2>Commanding <span class="zinfo">everything here is recorded and
+      lands on the next tick</span></h2>
+    <div class="cmdrow"><span class="cl">uplink</span>
+      <button id="tcon" type="button">payload ON</button>
+      <button id="tcoff" type="button">payload OFF</button>
+      <span class="hint">a real TC through the ground station's ARQ —
+        retransmitted until a pass gets it through</span>
+    </div>
+    <div class="cmdrow"><span class="cl">fault</span>
+      <select id="fkind"></select>
+      <span id="fparams" class="cmdrow" style="margin:0"></span>
+      <button id="finject" type="button">inject</button>
+      <span class="hint">ground truth — physics honors it immediately</span>
+    </div>
+    <div class="cmdrow"><span class="cl">raw bus</span>
+      <input type="text" id="rtopic" placeholder="topic, e.g. obc/mode">
+      <input type="text" id="rdata" class="grow"
+        placeholder='JSON payload, e.g. {"mode":"SAFE"}'>
+      <button id="rpub" type="button">publish</button>
+    </div>
+    <div class="cmdnote" id="cmdnote"></div>
   </div>
 </div>
 <script>
@@ -778,6 +903,118 @@ function drawControls() {
         state.speed) < 0.01 ? "on" : "";
   }
 }
+
+/* ---- command panel (live flights only) ---- */
+(function () {
+  if (BOOT.mode !== "live") return;
+  $("cmdpanel").style.display = "";
+  function note(txt, bad) {
+    $("cmdnote").textContent = txt;
+    $("cmdnote").className = "cmdnote" + (bad ? " bad" : "");
+  }
+  function send(body, desc) {
+    fetch("/control", { method: "POST", body: JSON.stringify(body) })
+      .then(function (r) {
+        if (r.ok) {
+          note(desc + " queued — lands on the next tick" +
+               (state.paused ? " (mission is paused)" : ""), false);
+        } else {
+          note(desc + " rejected (HTTP " + r.status + ")", true);
+        }
+      })
+      .catch(function () { note(desc + " failed — server unreachable", true); });
+  }
+  $("tcon").addEventListener("click", function () {
+    send({ action: "tc", cmd: 1, arg: 1 }, "TC payload-enable(1)");
+  });
+  $("tcoff").addEventListener("click", function () {
+    send({ action: "tc", cmd: 1, arg: 0 }, "TC payload-enable(0)");
+  });
+
+  var SENSORS = ["gyro", "mag", "sun", "battery_voltage"];
+  var FAULTS = [
+    { label: "stuck sensor", topic: "fault/sensor_stuck",
+      params: [["sensor", "select", SENSORS], ["hard", "check", false]],
+      data: function (p) {
+        return { sensor: p.sensor, stuck: true, hard: !!p.hard }; } },
+    { label: "unstick sensor", topic: "fault/sensor_stuck",
+      params: [["sensor", "select", SENSORS]],
+      data: function (p) { return { sensor: p.sensor, stuck: false }; } },
+    { label: "SEU bit flip", topic: "fault/seu",
+      params: [["sensor", "select", SENSORS]],
+      data: function (p) { return { sensor: p.sensor }; } },
+    { label: "wheel friction", topic: "fault/wheel_friction",
+      params: [["nm_per_nms", "number", "5e-5"]],
+      data: function (p) { return { nm_per_nms: p.nm_per_nms }; } },
+    { label: "array strike", topic: "fault/array_hit",
+      params: [["mult", "number", "0.7"]],
+      data: function (p) { return { mult: p.mult }; } },
+    { label: "channel BER", topic: "fault/channel",
+      params: [["ber_mult", "number", "50"]],
+      data: function (p) { return { ber_mult: p.ber_mult }; } },
+  ];
+  FAULTS.forEach(function (f, i) {
+    var o = document.createElement("option");
+    o.value = i; o.textContent = f.label;
+    $("fkind").appendChild(o);
+  });
+  var fwidgets = {};
+  function renderParams() {
+    var f = FAULTS[+$("fkind").value];
+    $("fparams").textContent = "";
+    fwidgets = {};
+    f.params.forEach(function (spec) {
+      var name = spec[0], kind = spec[1], init = spec[2], el;
+      if (kind === "select") {
+        el = document.createElement("select");
+        init.forEach(function (s) {
+          var o = document.createElement("option");
+          o.value = s; o.textContent = s;
+          el.appendChild(o);
+        });
+        $("fparams").appendChild(el);
+      } else if (kind === "check") {
+        var lab = document.createElement("label");
+        el = document.createElement("input");
+        el.type = "checkbox";
+        lab.appendChild(el);
+        lab.appendChild(document.createTextNode(name));
+        $("fparams").appendChild(lab);
+      } else {
+        el = document.createElement("input");
+        el.type = "number"; el.step = "any"; el.value = init;
+        el.title = name;
+        $("fparams").appendChild(el);
+      }
+      fwidgets[name] = { el: el, kind: kind };
+    });
+  }
+  $("fkind").addEventListener("change", renderParams);
+  renderParams();
+  $("finject").addEventListener("click", function () {
+    var f = FAULTS[+$("fkind").value], p = {}, name;
+    for (name in fwidgets) {
+      var w = fwidgets[name];
+      if (w.kind === "check") p[name] = w.el.checked;
+      else if (w.kind === "number") {
+        p[name] = parseFloat(w.el.value);
+        if (!isFinite(p[name])) { note(name + " is not a number", true); return; }
+      } else p[name] = w.el.value;
+    }
+    send({ action: "inject", topic: f.topic, data: f.data(p) }, f.label);
+  });
+
+  $("rpub").addEventListener("click", function () {
+    var topic = $("rtopic").value.trim(), data;
+    if (!topic) { note("topic is empty", true); return; }
+    try {
+      data = JSON.parse($("rdata").value.trim() || "{}");
+    } catch (e) {
+      note("payload is not valid JSON", true); return;
+    }
+    send({ action: "inject", topic: topic, data: data }, topic);
+  });
+})();
 
 /* ---- clock ---- */
 function drawClock() {

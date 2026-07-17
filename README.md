@@ -71,9 +71,13 @@ falls out.
   tiles and rolling telemetry lanes, a spacecraft-bus monitor (every
   topic with live payloads and rates — click one to tail it), the
   decoded space link, and an event ticker. Pause and 1–120×
-  time-acceleration controls; the mission flies itself. Because the
-  server just tails the flight recording over SSE, `--replay` re-flies
-  any finished recording the same way.
+  time-acceleration controls, plus a commanding panel on live flights:
+  queue a real TC through the ground station's ARQ, inject faults
+  mid-flight, or publish raw bus messages — everything is recorded, so
+  the flight stays replayable (though `(seed, dt)` alone no longer
+  reproduces a manually-commanded one). Because the server just tails
+  the flight recording over SSE, `--replay` re-flies any finished
+  recording the same way — view-only.
 
 Rules of the house:
 

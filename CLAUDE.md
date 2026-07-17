@@ -52,10 +52,6 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
 
 ## Backlog (agreed next steps, in rough priority)
 
-- **Live-console command panel** — the console (`cubesat_sim.live`) is
-  view-only by the owner's choice; the agreed follow-up is a panel to
-  queue real TCs through the ground station and trigger fault
-  injections mid-flight. The `POST /control` channel already exists.
 - **FDIR experiments from campaign 1** — three findings point the same
   direction: cross-sensor consistency checks (entry #10: one frozen
   gyro fools every gate) and debounced mode transitions (entry #12:
@@ -86,3 +82,8 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
   recording to self-contained HTML; the live console (`cubesat_sim.live`)
   tails a recording over SSE — headless-browser screenshots cannot
   exercise SSE, drive real CDP if you need to verify the live page.
+- The live console's command panel (live flights only) posts
+  `tc`/`inject` actions to `POST /control`; injections are queued and
+  applied on the runner thread between ticks, ground TCs ride `ops/tc`
+  into the station's ARQ, and `_payload_ok` keeps bridge poison
+  (null / non-finite) off the bus.

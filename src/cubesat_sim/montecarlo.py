@@ -107,8 +107,8 @@ def run_flight(
     crashed = ""
     try:
         sim.run(duration=duration)
-    except RuntimeError as exc:  # sim-integrity failure: report, never hide
-        crashed = str(exc)
+    except Exception as exc:  # sim-integrity failure: one bad flight must
+        crashed = f"{type(exc).__name__}: {exc}"  # never kill the campaign
     sim.recorder.flush()
     rec = sim.recorder
 

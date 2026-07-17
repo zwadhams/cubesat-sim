@@ -21,10 +21,20 @@ which is idiomatic flight software anyway.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from typing import Any
 
 from cubesat_sim.kernel.component import Component
+
+
+def _poison(value: Any) -> bool:
+    """True for values that must not touch the bus or recorder: JSON null
+    (serde_json's laundering of NaN/inf) and non-finite numbers (Python's
+    json.loads accepts the nonstandard Infinity/NaN tokens)."""
+    if value is None:
+        return True
+    return isinstance(value, float) and not math.isfinite(value)
 
 
 class RemoteComponent(Component):
@@ -60,9 +70,19 @@ class RemoteComponent(Component):
         }
         self._send(frame)
         out = self._recv()
+        # inbound quarantine: flight software can emit garbage (serde_json
+        # launders non-finite floats into JSON null), but garbage must not
+        # reach the bus or the recorder — reject it loudly instead
         for pub in out.get("pub", []):
-            self.publish(pub["topic"], **pub.get("data", {}))
+            data = pub.get("data", {})
+            if any(_poison(v) for v in data.values()):
+                self.event("pub_reject", topic=pub.get("topic", "?"))
+                continue
+            self.publish(pub["topic"], **data)
         for key, value in out.get("telemetry", {}).items():
+            if _poison(value):
+                self.event("telemetry_reject", key=key)
+                continue
             self.record(key, float(value))
         for ev in out.get("events", []):
             self.event(ev["kind"], **ev.get("detail", {}))

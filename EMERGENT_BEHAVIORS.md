@@ -177,3 +177,96 @@ Template:
   table makes the gap measurable rather than hypothetical; extending the
   watchdog pattern to the mag is straightforward if a future phase wants
   the comparison flight.
+
+## 9. NaN laundering across the language boundary (fixed — broke sim
+##    integrity)
+- first observed: science campaign 1 (24 seeds x 12 orbits), seed 13
+- reproduce: at 064b23f, `run_flight(13, orbits=12, dt=5.0,
+  seu_rate_per_day=6.0)` — dies with `float() argument must be ... not
+  'NoneType'`
+- mechanism: a three-hop laundering chain, each hop locally reasonable.
+  (1) An SEU flips a top exponent bit in a gyro word: the reading becomes
+  ~1e300 — *finite*, so it sails through the physics layer's non-finite
+  guard and the bridge's `allow_nan=False`. (2) The Rust ADCS computes
+  its rate telemetry as `norm(gyro)`: squaring 1e300 overflows f64 to
+  infinity — still fine inside Rust, every operation total. (3)
+  serde_json cannot represent inf in standard JSON and silently
+  serializes it as `null`; the bridge calls `float(None)` on it and the
+  whole simulation dies. Three languages, three correct local decisions,
+  one dead spacecraft bus. The 94-test suite never caught it because the
+  lethal combination (SEU on the gyro × top exponent bit × a frame that
+  squares it) is rare — it took a campaign's worth of dice rolls.
+- status: fixed (crash = integrity): the Rust ADCS now saturates its
+  rate word at 9999 deg/s and zeroes non-finite actuator commands (the
+  output-limiter discipline real FSW uses — the C++ comms already
+  clipped its telemetry words); the bridge quarantines JSON null and
+  non-finite values from flight software, rejecting the message with a
+  loud `pub_reject`/`telemetry_reject` event instead of dying; and one
+  crashed flight no longer kills a whole campaign (outcome CRASHED,
+  sweep continues).
+
+## 10. The confident corpse: a gyro frozen at zero pumps a tumble it cannot see
+- first observed: science campaign 1, seed 19 (24 seeds x 12 orbits)
+- reproduce: `run_flight(19, orbits=12, dt=5.0, seu_rate_per_day=6.0)`;
+  recording at runs/campaign1/flight_0019.db
+- mechanism: the mirror image of entry 7, and nastier. A hard gyro
+  latch-up (orbit 5.32) freezes the rate word at 0.02 deg/s — *below*
+  every mode gate, where entry 7's froze above them. So instead of being
+  locked out of sun-point, the ADCS is locked **in** it: FDIR burns its
+  budget and gives up (orbit 5.34), and the controller keeps commanding
+  forever with a dead damping term (kd x 0.02 ~ nothing). The P term
+  chases the sun vector undamped through the bus's one-tick latency —
+  entry 4's pump, reawakened by a frozen sensor instead of a threshold
+  race — and spins the vehicle from 0.07 to 8.25 deg/s within half an
+  orbit. Nobody on board can know: the spacecraft has ONE gyro, so the
+  OBC watchdog sanity-checks the same frozen word (0.02 < every limit,
+  forever "healthy"). Truth vs belief at end of flight: tumbling at
+  7.8 deg/s; the ADCS reports 0.02. The power system then tells the
+  usual story — chopped generation, SAFE, shed floor at 0.15 SoC.
+- status: kept — flagship campaign-1 finding. Points straight at
+  cross-sensor consistency FDIR: the mag sees a rotating field and the
+  sun sensor sees a spinning sun; either could impeach the frozen gyro.
+  Entries 7 and 10 together say the danger of a stuck sensor is decided
+  by *which side of a mode gate it freezes on* — pure luck.
+
+## 11. Three protections, zero science: the ground veto starves the mission
+- first observed: science campaign 1, seed 0
+- reproduce: `run_flight(0, orbits=12, dt=5.0, seu_rate_per_day=6.0)`;
+  recording at runs/campaign1/flight_0000.db
+- mechanism: an array strike at orbit 1.15 (x0.68 output) makes a
+  degraded bird. The OBC falls into the eclipse-phase-locked SAFE
+  limit cycle (entry 1's oscillator, alive again post-Phase-3 at this
+  fault profile). At the orbit-4.25 pass the ground's power veto sees
+  soc_est 0.29 and uplinks payload-disable — correctly, by its rule.
+  But re-enable requires *hearing* soc_est > 0.55 during a pass, and a
+  degraded array lives in the estimator's sag zone: the onboard
+  estimate oscillates 0.15-0.45 and only brushes higher in brief full-
+  sun moments that never coincide with a beacon in a pass window. The
+  veto latches for the remaining 8 orbits. Five imaging-target passes
+  occur; the instrument is commanded off for all of them; total science
+  returned: 0.0 MB. EPS shed, OBC SAFE, and the ground veto each did
+  exactly their job — three layered protections, and their intersection
+  starved the mission to death while keeping the corpse healthy.
+- status: kept — the ground-segment sibling of entry 6's one-way door.
+  The asymmetric thresholds (disable at 0.30 heard, re-enable at 0.55
+  heard) assume the estimate is unbiased; entry 1's sag bias breaks
+  that assumption exactly when the veto matters.
+
+## 12. Radiation toggles the mode switch: SEU -> saturated estimate -> SAFE exit
+- first observed: science campaign 1, seeds 0 and 19 (independently)
+- reproduce: either campaign recording; look for `mode_change` to
+  NOMINAL with `soc_est: 1.0` mid-crisis (seed 0 at orbits 6.56 and
+  7.71, seed 19 at 7.69)
+- mechanism: a SEU flips a high bit in the battery-voltage sensor word;
+  the EPS's voltage-derived estimate clamps to exactly 1.0 for one
+  sample; the OBC's SAFE-exit test (`soc_est > 0.45`) has no debounce,
+  so a single corrupt sample flips the spacecraft to NOMINAL — payload
+  commanded back on in the middle of a power emergency — until the next
+  honest sample sends it back to SAFE a step later. One particle, one
+  sample, one mode transition. The saturating clamp (0..1) makes the
+  corruption *plausible-looking*: 1.0 is a legal value, so no sanity
+  check fires.
+- status: kept — the cheapest possible argument for debounced mode
+  transitions (real FDIR requires persistence: N consecutive samples
+  past threshold). Also a quiet warning about clamps: saturation
+  converts absurd inputs into credible ones.

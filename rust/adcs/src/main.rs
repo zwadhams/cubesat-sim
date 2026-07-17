@@ -77,11 +77,10 @@ fn norm(a: [f64; 3]) -> f64 {
 }
 
 fn clamp3(a: [f64; 3], limit: f64) -> [f64; 3] {
-    [
-        a[0].clamp(-limit, limit),
-        a[1].clamp(-limit, limit),
-        a[2].clamp(-limit, limit),
-    ]
+    // output limiter, the flight-software way: saturate to the actuator's
+    // hardware limit, and a non-finite command becomes "do nothing"
+    let sane = |v: f64| if v.is_finite() { v.clamp(-limit, limit) } else { 0.0 };
+    [sane(a[0]), sane(a[1]), sane(a[2])]
 }
 
 struct Adcs {
@@ -156,7 +155,13 @@ impl Adcs {
         let kd = KD.min(0.4 * I_MIN / dt);
         let kp = KP.min(0.1 * I_MIN / (dt * dt));
 
-        let rate_dps = norm(self.gyro).to_degrees();
+        // saturating telemetry word: a SEU-corrupted gyro can read ~1e300
+        // (finite, so it passes every upstream guard), whose square
+        // overflows to inf — and serde_json launders non-finite floats
+        // into JSON null, which is poison on the bus. Real FSW clips.
+        let raw_rate = norm(self.gyro).to_degrees();
+        let rate_dps = if raw_rate.is_finite() { raw_rate.min(9999.0) }
+                       else { 9999.0 };
         let mut events: Vec<Value> = Vec::new();
 
         let new_mode = match self.mode {

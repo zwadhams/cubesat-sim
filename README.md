@@ -65,6 +65,15 @@ falls out.
   power-protection veto beside the storage rule.
   `python -m cubesat_sim.linkdump <recording.db>` plays protocol
   analyzer over any flight.
+- **Live mission console** (`cubesat_sim.live`) — flies a mission paced
+  to wall clock and serves an ops-room page in the browser: mission
+  clock, the orbit globe with the sat moving in real time, live stat
+  tiles and rolling telemetry lanes, a spacecraft-bus monitor (every
+  topic with live payloads and rates — click one to tail it), the
+  decoded space link, and an event ticker. Pause and 1–120×
+  time-acceleration controls; the mission flies itself. Because the
+  server just tails the flight recording over SSE, `--replay` re-flies
+  any finished recording the same way.
 
 Rules of the house:
 
@@ -114,6 +123,12 @@ cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
 .venv/bin/python examples/phase6_link_demo.py
 .venv/bin/python -m cubesat_sim.dashboard runs/phase6_link.db   # -> .html report
 .venv/bin/python -m cubesat_sim.linkdump runs/phase6_link.db    # decode the link
+
+# fly live and watch at http://localhost:8765 (60x wall clock, faults on)
+.venv/bin/python -m cubesat_sim.live --seed 19 --orbits 4 --seu-rate 6 \
+    --campaign --speed 60
+# or re-fly a finished recording the same way
+.venv/bin/python -m cubesat_sim.live --replay runs/mc/flight_0019.db --speed 120
 ```
 
 To fly with the C flight software instead of the Python references:

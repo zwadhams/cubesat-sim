@@ -1,0 +1,1376 @@
+"""Live mission console: fly a mission in real time and watch it happen.
+
+The simulator already streams everything it does — every bus message,
+telemetry sample, and event — into the SQLite flight recording. Live mode
+runs the mission one tick at a time, paced to wall clock, and a small
+stdlib HTTP server tails the recording, pushing new rows to the browser
+over Server-Sent Events. The page is an ops console: mission clock, orbit
+globe, live telemetry lanes, the raw spacecraft bus, the decoded space
+link, and an event ticker. View-only by design — pause and time
+acceleration are the only controls; the mission flies itself.
+
+Because the server only ever tails a recording, `--replay` can "fly" any
+finished flight (a Monte Carlo campaign recording, say) at any speed.
+
+Usage:
+    python -m cubesat_sim.live --seed 19 --orbits 4 --seu-rate 6 --speed 60
+    python -m cubesat_sim.live --replay runs/campaign1/flight_0019.db
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sqlite3
+import threading
+import time as _time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from cubesat_sim.dashboard import DIGITAL_TRACKS, ANALOG_LANES, _fmt_detail, \
+    _orbit_geometry, _severity
+from cubesat_sim.environment.orbit import CircularOrbit
+from cubesat_sim.linkdump import describe_link_message
+from cubesat_sim.mission import build_sim
+from cubesat_sim.montecarlo import random_fault_campaign
+
+_PERIOD = CircularOrbit().period_s
+LANE_WINDOW_S = 1.5 * _PERIOD
+
+# the rolling lanes worth watching live (subset of the report's lanes)
+LIVE_LANE_TITLES = ("State of charge", "Electrical power", "Body rate",
+                    "Temperatures", "Data")
+
+# per-poll row caps so a late-joining client backfills over a few frames
+# instead of one giant one
+_LIMITS = {"messages": 3000, "telemetry": 12000, "events": 1000}
+_POLL_S = 0.25
+
+
+@dataclass
+class LiveControl:
+    """Shared state between the mission runner, /control, and SSE tailers."""
+    speed: float = 30.0        # sim seconds per wall second; inf = unpaced
+    paused: bool = False
+    stop: bool = False
+    sim_time: float = 0.0
+    tick: int = 0
+    done: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def set(self, **kw) -> None:
+        with self._lock:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    def status(self) -> dict:
+        with self._lock:
+            return {"t": round(self.sim_time, 3), "tick": self.tick,
+                    "paused": self.paused, "done": self.done,
+                    "speed": None if math.isinf(self.speed) else self.speed}
+
+
+def fly(sim, ctl: LiveControl, duration_s: float) -> None:
+    """Run the mission one tick at a time, paced to wall clock. Each
+    run(ticks=1) call flushes, so the tick's rows are committed and visible
+    to the read-only tailer connections the moment it lands."""
+    ticks = max(1, round(duration_s / sim.dt))
+    try:
+        for _ in range(ticks):
+            while ctl.paused and not ctl.stop:
+                _time.sleep(0.05)
+            if ctl.stop:
+                break
+            sim.run(ticks=1)
+            ctl.set(sim_time=sim.clock.time, tick=sim.clock.tick)
+            # pace: chunked wait so pause and speed changes bite within ~100 ms
+            deadline = _time.monotonic()
+            while not ctl.stop and not ctl.paused:
+                speed = ctl.speed
+                if not math.isfinite(speed):
+                    break
+                wait = deadline + sim.dt / speed - _time.monotonic()
+                if wait <= 0:
+                    break
+                _time.sleep(min(wait, 0.1))
+    finally:
+        # even a crashed runner must not leave the console reading "LIVE"
+        ctl.set(done=True)
+
+
+def pace_replay(ctl: LiveControl, t_end: float, dt: float) -> None:
+    """Advance a virtual mission clock through a finished recording; the
+    SSE tailers only serve rows up to the virtual now."""
+    while not ctl.stop and ctl.sim_time < t_end:
+        _time.sleep(0.05)
+        if ctl.paused:
+            continue
+        speed = ctl.speed
+        t = t_end if math.isinf(speed) else min(t_end, ctl.sim_time + 0.05 * speed)
+        ctl.set(sim_time=t, tick=int(t / dt))
+    ctl.set(done=True)
+
+
+def _lane_specs() -> list[dict]:
+    out = []
+    for title, _section, hint, unit, domain, series in ANALOG_LANES:
+        if title not in LIVE_LANE_TITLES:
+            continue
+        out.append({
+            "title": title, "hint": hint, "unit": unit,
+            "domain": list(domain) if domain else None,
+            "series": [{"source": src, "key": key, "label": label,
+                        "tf": tf_name}
+                       for src, key, label, (tf_name, _fn) in series],
+        })
+    return out
+
+
+def _boot_common(title: str, mode: str, meta: dict) -> dict:
+    return {
+        "title": title, "mode": mode, "meta": meta,
+        "orbit3d": _orbit_geometry(meta["epoch"]),
+        "lanes": _lane_specs(),
+        "pills": [{"source": s, "key": k, "label": lb}
+                  for s, k, lb in DIGITAL_TRACKS],
+    }
+
+
+def _live_boot(sim, duration_s: float, db_path: Path) -> dict:
+    return _boot_common(db_path.stem, "live", {
+        "seed": sim.seed, "dt": sim.dt,
+        "epoch": sim.clock.epoch.isoformat(),
+        "duration_s": round(duration_s, 2), "period_s": round(_PERIOD, 2)})
+
+
+def _replay_boot(db_path: Path) -> tuple[dict, float, float]:
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        meta = dict(db.execute("SELECT key, value FROM meta").fetchall())
+        t_end = db.execute("SELECT MAX(time) FROM telemetry").fetchone()[0] or 0.0
+    finally:
+        db.close()
+    dt = float(json.loads(meta.get("dt", "1.0")))
+    boot = _boot_common(db_path.stem, "replay", {
+        "seed": json.loads(meta.get("seed", "0")), "dt": dt,
+        "epoch": json.loads(meta["epoch"]) if "epoch" in meta else None,
+        "duration_s": round(t_end, 2), "period_s": round(_PERIOD, 2)})
+    return boot, t_end, dt
+
+
+class _Handler(BaseHTTPRequestHandler):
+    # injected by Console via a per-instance subclass:
+    ctl: LiveControl
+    db_path: str
+    page: bytes
+
+    def log_message(self, fmt, *args):  # keep the terminal quiet
+        pass
+
+    def do_GET(self):
+        if self.path == "/" or self.path.startswith("/?"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(self.page)))
+            self.end_headers()
+            self.wfile.write(self.page)
+        elif self.path.startswith("/events"):
+            self._stream()
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path != "/control":
+            self.send_error(404)
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(400)
+            return
+        action = body.get("action")
+        if action == "pause":
+            self.ctl.set(paused=True)
+        elif action == "resume":
+            self.ctl.set(paused=False)
+        elif action == "speed":
+            try:
+                v = float(body.get("value", 30.0))
+            except (TypeError, ValueError):
+                self.send_error(400)
+                return
+            if math.isfinite(v) and v > 0:
+                self.ctl.set(speed=min(max(v, 0.1), 10000.0))
+        else:
+            self.send_error(400)
+            return
+        self.send_response(204)
+        self.end_headers()
+
+    # -- the tail ------------------------------------------------------------
+
+    def _stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        db.execute("PRAGMA busy_timeout=2000")
+        try:
+            self.wfile.write(b"retry: 1500\n\n")
+            now = self.ctl.status()["t"]
+            # a late joiner backfills one lane window of telemetry, a minute
+            # of bus traffic (the topic table repopulates itself anyway),
+            # and the whole event history (small)
+            cursors = {
+                "messages": self._floor(db, "messages", now - 60.0),
+                "telemetry": self._floor(db, "telemetry", now - LANE_WINDOW_S),
+                "events": 0,
+            }
+            while not self.ctl.stop:
+                frame, backlog = self._collect(db, cursors)
+                blob = json.dumps(frame, separators=(",", ":")).encode()
+                self.wfile.write(b"data: " + blob + b"\n\n")
+                self.wfile.flush()
+                if not backlog:
+                    _time.sleep(_POLL_S)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # client went away
+        finally:
+            db.close()
+
+    @staticmethod
+    def _floor(db, table: str, t: float) -> int:
+        row = db.execute(
+            f"SELECT COALESCE(MAX(rowid), 0) FROM {table} WHERE time < ?",
+            (max(t, 0.0),)).fetchone()
+        return row[0]
+
+    def _collect(self, db, cursors) -> tuple[dict, bool]:
+        status = self.ctl.status()
+        now = status["t"] + 1e-9
+        frame: dict = {"status": status}
+        backlog = False
+
+        rows = db.execute(
+            "SELECT rowid, time, topic, sender, data FROM messages "
+            "WHERE rowid > ? AND time <= ? ORDER BY rowid LIMIT ?",
+            (cursors["messages"], now, _LIMITS["messages"])).fetchall()
+        if rows:
+            cursors["messages"] = rows[-1][0]
+            backlog |= len(rows) == _LIMITS["messages"]
+            msgs = []
+            for _rid, t, topic, sender, blob in rows:
+                data = json.loads(blob)
+                m = {"t": round(t, 2), "topic": topic, "sender": sender,
+                     "data": data}
+                link = describe_link_message(topic, data)
+                if link is not None:
+                    m["link"] = link
+                msgs.append(m)
+            frame["messages"] = msgs
+
+        rows = db.execute(
+            "SELECT rowid, time, source, key, value FROM telemetry "
+            "WHERE rowid > ? AND time <= ? ORDER BY rowid LIMIT ?",
+            (cursors["telemetry"], now, _LIMITS["telemetry"])).fetchall()
+        if rows:
+            cursors["telemetry"] = rows[-1][0]
+            backlog |= len(rows) == _LIMITS["telemetry"]
+            frame["telemetry"] = [
+                [round(t, 2), source, key, round(value, 6)]
+                for _rid, t, source, key, value in rows]
+
+        rows = db.execute(
+            "SELECT rowid, time, source, kind, detail FROM events "
+            "WHERE rowid > ? AND time <= ? ORDER BY rowid LIMIT ?",
+            (cursors["events"], now, _LIMITS["events"])).fetchall()
+        if rows:
+            cursors["events"] = rows[-1][0]
+            backlog |= len(rows) == _LIMITS["events"]
+            evs = []
+            for _rid, t, source, kind, detail_json in rows:
+                detail = json.loads(detail_json) if detail_json else {}
+                evs.append({"t": round(t, 2), "source": source, "kind": kind,
+                            "sev": _severity(kind, detail),
+                            "detail": _fmt_detail(detail)})
+            frame["events"] = evs
+
+        return frame, backlog
+
+
+class Console:
+    """One live console: mission (or replay pacer) + HTTP server. `main()`
+    is a thin CLI over this; tests drive it directly."""
+
+    def __init__(self, *, replay: str | Path | None = None,
+                 db: str | Path = "runs/live.db",
+                 host: str = "127.0.0.1", port: int = 8765,
+                 speed: float = 30.0, seed: int = 0, orbits: float = 4.0,
+                 duration: float | None = None, dt: float = 5.0,
+                 seu_rate_per_day: float = 0.0, campaign: bool = False,
+                 **build_kw) -> None:
+        self.ctl = LiveControl(speed=float(speed))
+        self.sim = None
+        if replay is not None:
+            self.db_path = Path(replay)
+            boot, t_end, rec_dt = _replay_boot(self.db_path)
+            self._worker = threading.Thread(
+                target=pace_replay, args=(self.ctl, t_end, rec_dt), daemon=True)
+        else:
+            self.db_path = Path(db)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            duration = duration if duration is not None else orbits * _PERIOD
+            faults = random_fault_campaign(seed, duration) if campaign else []
+            self.sim = build_sim(dt=dt, seed=seed, recorder_path=self.db_path,
+                                 faults=faults,
+                                 seu_rate_per_day=seu_rate_per_day, **build_kw)
+            self.sim.recorder.enable_wal()
+            self.sim.recorder.flush()
+            boot = _live_boot(self.sim, duration, self.db_path)
+            self._worker = threading.Thread(
+                target=fly, args=(self.sim, self.ctl, duration), daemon=True)
+        blob = json.dumps(boot, separators=(",", ":")).replace("</", "<\\/")
+        page = (_PAGE.replace("__TITLE__", boot["title"])
+                .replace("__BOOT__", blob)).encode()
+        handler = type("BoundHandler", (_Handler,), {
+            "ctl": self.ctl, "db_path": str(self.db_path), "page": page})
+        self.server = ThreadingHTTPServer((host, port), handler)
+        self._server_thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.2},
+            daemon=True)
+
+    @property
+    def url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}/"
+
+    def start(self) -> "Console":
+        self._worker.start()
+        self._server_thread.start()
+        return self
+
+    def join(self, timeout: float | None = None) -> None:
+        self._worker.join(timeout)
+
+    def stop(self) -> None:
+        self.ctl.set(stop=True)
+        self._worker.join(timeout=10)
+        self.server.shutdown()
+        self.server.server_close()
+        if self.sim is not None:
+            self.sim.close()
+            self.sim = None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Fly a mission paced to wall clock and watch it live "
+                    "in the browser (or --replay a finished recording).")
+    ap.add_argument("--replay", metavar="DB",
+                    help="watch a finished recording instead of flying")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="mission seed; every run is reproducible from it")
+    ap.add_argument("--orbits", type=float, default=4.0,
+                    help="mission length in orbits (default 4, ~1.6 h each)")
+    ap.add_argument("--duration", type=float,
+                    help="mission length in sim seconds (overrides --orbits)")
+    ap.add_argument("--dt", type=float, default=5.0,
+                    help="sim timestep in seconds (default 5)")
+    ap.add_argument("--seu-rate", type=float, default=0.0,
+                    help="SEU bit flips per day (SAA-modulated)")
+    ap.add_argument("--campaign", action="store_true",
+                    help="seed-deterministic random fault campaign "
+                         "(same generator as the Monte Carlo harness)")
+    ap.add_argument("--speed", default="30",
+                    help="sim seconds per wall second, or 'max' (default 30)")
+    ap.add_argument("--port", type=int, default=8765,
+                    help="console port (default 8765)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address; 0.0.0.0 exposes it to your LAN")
+    ap.add_argument("--db", default="runs/live.db",
+                    help="recording path for live flights")
+    args = ap.parse_args()
+
+    speed = math.inf if args.speed == "max" else float(args.speed)
+    console = Console(replay=args.replay, db=args.db, host=args.host,
+                      port=args.port, speed=speed, seed=args.seed,
+                      orbits=args.orbits, duration=args.duration, dt=args.dt,
+                      seu_rate_per_day=args.seu_rate, campaign=args.campaign)
+    console.start()
+    mode = "replaying" if args.replay else "flying"
+    print(f"{mode} {console.db_path} — console at {console.url}  "
+          f"(Ctrl+C to stop)")
+    try:
+        announced = False
+        while True:
+            _time.sleep(0.5)
+            if console.ctl.done and not announced:
+                announced = True
+                what = ("replay finished"
+                        if args.replay else
+                        f"mission complete — recording at {console.db_path}")
+                print(f"{what}; console still up at {console.url}")
+    except KeyboardInterrupt:
+        print("\nshutting down")
+    finally:
+        console.stop()
+
+
+_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ — live console</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #008300; --s3: #e87ba4; --s4: #eda100;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --band: rgba(11,11,11,0.045);
+  --bandc: rgba(42,120,214,0.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835;
+    --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #008300; --s3: #d55181; --s4: #c98500;
+    --band: rgba(255,255,255,0.055);
+    --bandc: rgba(57,135,229,0.13);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255,255,255,0.10);
+  --s1: #3987e5; --s2: #008300; --s3: #d55181; --s4: #c98500;
+  --band: rgba(255,255,255,0.055);
+  --bandc: rgba(57,135,229,0.13);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.console { max-width: 1120px; margin: 0 auto; padding: 18px 16px 48px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+         margin: 4px 2px 12px; }
+header h1 { font-size: 19px; font-weight: 650; margin: 0; }
+header .chips { color: var(--ink-2); font-size: 12.5px; }
+header button {
+  margin-left: auto; font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 3px 10px; cursor: pointer;
+}
+.conn { width: 9px; height: 9px; border-radius: 50%; align-self: center;
+        background: var(--muted); flex: none; }
+.conn.ok { background: var(--good); }
+.conn.err { background: var(--critical); }
+.card { background: var(--surface); border: 1px solid var(--border);
+        border-radius: 10px; padding: 12px 14px 12px; margin-bottom: 12px; }
+.card h2 { font-size: 13px; font-weight: 650; margin: 0 0 8px; color: var(--ink); }
+.card h2 .zinfo { font-weight: 400; font-size: 11.5px; color: var(--muted);
+                  margin-left: 8px; }
+.cmdbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.clock .t { font-size: 26px; font-weight: 650;
+            font-variant-numeric: tabular-nums; line-height: 1.15; }
+.clock .sub { font-size: 12px; color: var(--ink-2);
+              font-variant-numeric: tabular-nums; }
+.runstate { font-size: 11.5px; font-weight: 650; letter-spacing: 0.07em;
+            border: 1px solid var(--border); border-radius: 999px;
+            padding: 3px 12px; color: var(--ink-2); }
+.runstate.live { color: var(--good); border-color: var(--good); }
+.runstate.paused { color: var(--warning); border-color: var(--warning); }
+.cmdbar .grow { flex: 1; }
+.cmdbar button, .speeds button {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 4px 12px; cursor: pointer;
+}
+.speeds { display: flex; gap: 6px; align-items: center; }
+.speeds .lb { font-size: 11.5px; color: var(--muted); margin-right: 2px; }
+.speeds button.on { color: var(--ink); border-color: var(--s1); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+         gap: 10px; margin-bottom: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--border);
+        border-radius: 10px; padding: 10px 12px 9px; }
+.tile .lb { font-size: 12px; color: var(--ink-2); }
+.tile .vl { font-size: 22px; font-weight: 600; margin-top: 1px;
+            font-variant-numeric: tabular-nums; }
+.tile .vl.warn { color: var(--serious); }
+.tile .nt { font-size: 11.5px; color: var(--muted); margin-top: 1px;
+            min-height: 15px; font-variant-numeric: tabular-nums; }
+.duo { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
+@media (max-width: 840px) { .duo { grid-template-columns: 1fr; } }
+#orbit canvas { display: block; width: 100%; touch-action: none;
+                border-radius: 6px; cursor: grab; }
+.orbit-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.chip { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
+        border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.chip.on { color: var(--ink); border-color: var(--s1); }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
+        border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.pill.on { color: var(--ink); border-color: var(--s1);
+           background: var(--bandc); }
+.feed { max-height: 260px; overflow-y: auto; font-size: 12px;
+        overscroll-behavior: contain; }
+.feed.mono { font: 11.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas,
+             monospace; white-space: pre-wrap; word-break: break-all; }
+.ev { padding: 1.5px 0; color: var(--ink-2);
+      font-variant-numeric: tabular-nums; }
+.ev b { color: var(--ink); font-weight: 600; }
+.sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+       margin-right: 6px; }
+.lane { margin-bottom: 4px; }
+.lane-head { display: flex; align-items: baseline; gap: 8px; margin: 8px 2px 2px;
+             flex-wrap: wrap; }
+.lane-head .t { font-size: 12.5px; font-weight: 650; }
+.lane-head .u { font-size: 11.5px; color: var(--muted); }
+.legend { margin-left: auto; display: flex; gap: 14px; font-size: 11.5px;
+          color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.legend .key { display: inline-block; width: 14px; height: 0;
+               border-top: 2.5px solid; border-radius: 2px;
+               vertical-align: middle; margin-right: 5px; }
+.lane canvas { display: block; width: 100%; }
+.tblwrap { overflow-x: auto; }
+table { border-collapse: collapse; font-size: 12px; width: 100%; }
+th { text-align: left; color: var(--ink-2); font-weight: 600;
+     position: sticky; top: 0; background: var(--surface); }
+th, td { padding: 3px 10px 3px 0; border-bottom: 1px solid var(--grid);
+         white-space: nowrap; }
+td.num { font-variant-numeric: tabular-nums; }
+td.mono { font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          max-width: 480px; overflow: hidden; text-overflow: ellipsis; }
+tr.pinned td { background: var(--bandc); }
+#bustbl tbody tr { cursor: pointer; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+       background: var(--s1); opacity: 0.15; }
+.dot.ping { animation: ping 0.9s ease-out; }
+@keyframes ping { from { opacity: 1; } to { opacity: 0.15; } }
+@media (prefers-reduced-motion: reduce) {
+  .dot.ping { animation: none; opacity: 0.6; }
+}
+.card input[type="text"] {
+  font: inherit; font-size: 12.5px; color: var(--ink);
+  background: var(--page); border: 1px solid var(--border);
+  border-radius: 7px; padding: 3px 10px; margin-left: auto; width: 220px;
+}
+.card-head { display: flex; align-items: baseline; gap: 10px;
+             margin-bottom: 8px; flex-wrap: wrap; }
+.card-head h2 { margin: 0; }
+.tail-head { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px;
+             font-size: 12px; color: var(--ink-2); }
+.tail-head button { font: inherit; font-size: 11.5px; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 1px 9px; cursor: pointer; }
+.linkline { color: var(--ink-2); }
+.linkline.up { color: var(--s1); }
+.linkline.bad { color: var(--critical); }
+details { margin: 10px 2px 0; color: var(--ink-2); }
+summary { cursor: pointer; font-size: 12.5px; }
+.overlay { text-align: center; color: var(--muted); font-size: 12.5px;
+           padding: 8px 0 2px; }
+</style>
+</head>
+<body>
+<div class="console">
+  <header>
+    <h1>__TITLE__</h1>
+    <span class="chips" id="metachips"></span>
+    <span class="conn" id="conn" title="stream"></span>
+    <button id="themebtn" type="button">theme: auto</button>
+  </header>
+
+  <div class="card cmdbar">
+    <div class="clock">
+      <div class="t" id="clk">T+00:00:00</div>
+      <div class="sub" id="clksub">—</div>
+    </div>
+    <span class="runstate" id="runstate">connecting</span>
+    <span class="grow"></span>
+    <button id="pausebtn" type="button">Pause</button>
+    <span class="speeds" id="speeds"><span class="lb">speed</span></span>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="duo">
+    <div class="card">
+      <h2>Orbit <span class="zinfo">drag to rotate</span></h2>
+      <div id="orbit"></div>
+      <div class="orbit-chips">
+        <span class="chip" id="orbchip">orbit 0.00</span>
+        <span class="chip" id="eclchip">—</span>
+        <span class="chip" id="conchip">—</span>
+        <span class="chip" id="saachip">—</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Spacecraft state</h2>
+      <div class="pills" id="pills"></div>
+      <h2 style="margin:14px 0 6px">Events</h2>
+      <div class="feed" id="events"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Telemetry <span class="zinfo" id="lanewin"></span></h2>
+    <div id="lanes"></div>
+    <details id="alltlm">
+      <summary>All telemetry — latest values</summary>
+      <div class="tblwrap"><table id="alltbl">
+        <thead><tr><th>source</th><th>key</th><th>value</th><th>age</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </details>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Spacecraft bus <span class="zinfo">every topic, live — click a row
+        to tail it</span></h2>
+      <input type="text" id="busfilter" placeholder="filter topics, e.g. sensors/">
+    </div>
+    <div class="tblwrap"><table id="bustbl">
+      <thead><tr><th></th><th>topic</th><th>sender</th><th>rate</th>
+        <th>last payload</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div id="tailwrap" style="display:none">
+      <div class="tail-head"><span id="tailtitle"></span>
+        <button id="tailclose" type="button">unpin</button></div>
+      <div class="feed mono" id="tail"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Space link <span class="zinfo">decoded frames, ground &#8596; sat
+      (&#8595; telemetry down, &#8593; commands up)</span></h2>
+    <div class="feed mono" id="link"></div>
+  </div>
+</div>
+<script>
+"use strict";
+var BOOT = __BOOT__;
+var PERIOD = BOOT.meta.period_s;
+var WIN = PERIOD * 1.5;
+var EPOCH_MS = BOOT.meta.epoch ? Date.parse(BOOT.meta.epoch) : null;
+var SCOL = ["--s1", "--s2", "--s3", "--s4"];
+var reduced = window.matchMedia &&
+    matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function $(id) { return document.getElementById(id); }
+function div(cls, parent, text) {
+  var d = document.createElement("div");
+  d.className = cls;
+  if (text !== undefined) d.textContent = text;
+  if (parent) parent.appendChild(d);
+  return d;
+}
+function css(name) {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+}
+function fmt(v) {
+  if (v === null || v === undefined) return "—";
+  var a = Math.abs(v);
+  if (a >= 1000) return v.toFixed(0);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  return v.toFixed(3);
+}
+function pad(n) { return (n < 10 ? "0" : "") + n; }
+
+/* ---- theme ---- */
+(function () {
+  var KEY = "cubesat-live-theme", modes = ["auto", "light", "dark"];
+  var cur = localStorage.getItem(KEY) || "auto";
+  function apply() {
+    if (cur === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", cur);
+    $("themebtn").textContent = "theme: " + cur;
+  }
+  $("themebtn").addEventListener("click", function () {
+    cur = modes[(modes.indexOf(cur) + 1) % 3];
+    localStorage.setItem(KEY, cur);
+    apply();
+  });
+  apply();
+})();
+
+/* ---- state ---- */
+var state = {
+  simTime: 0, tick: 0, paused: false, speed: 30, done: false,
+  statusWall: null, mode: BOOT.mode,
+};
+var latest = {};       // "source/key" -> [t, value]
+var laneIndex = {};    // "source/key" -> [series buffer, ...]
+var lanes = [];
+var bus = {};          // "topic|sender" -> row record
+var pinned = null;
+
+function lv(key) {
+  var e = latest[key];
+  return e ? e[1] : null;
+}
+function displayTime() {
+  if (state.statusWall === null || state.paused || state.done ||
+      state.speed === null) return state.simTime;
+  var e = (performance.now() - state.statusWall) / 1000;
+  return state.simTime + Math.min(e, 1.5) * state.speed;
+}
+
+/* ---- header chips ---- */
+$("metachips").textContent =
+  (BOOT.mode === "replay" ? "replay · " : "live · ") +
+  "seed " + BOOT.meta.seed + " · dt " + BOOT.meta.dt + " s · plan " +
+  (BOOT.meta.duration_s / PERIOD).toFixed(1) + " orbits";
+$("lanewin").textContent = "rolling window · last 1.5 orbits";
+
+/* ---- control strip ---- */
+function post(body) {
+  fetch("/control", { method: "POST", body: JSON.stringify(body) });
+}
+$("pausebtn").addEventListener("click", function () {
+  post({ action: state.paused ? "resume" : "pause" });
+});
+var SPEEDS = [1, 10, 30, 60, 120];
+SPEEDS.forEach(function (v) {
+  var b = document.createElement("button");
+  b.textContent = v + "×";
+  b.dataset.v = v;
+  b.addEventListener("click", function () {
+    post({ action: "speed", value: v });
+  });
+  $("speeds").appendChild(b);
+});
+function drawControls() {
+  $("pausebtn").textContent = state.paused ? "Resume" : "Pause";
+  $("pausebtn").disabled = state.done;
+  var rs = $("runstate");
+  if (state.done) {
+    rs.textContent = state.mode === "replay" ? "REPLAY DONE" : "COMPLETE";
+    rs.className = "runstate";
+  } else if (state.paused) {
+    rs.textContent = "PAUSED"; rs.className = "runstate paused";
+  } else {
+    rs.textContent = state.mode === "replay" ? "REPLAY" : "LIVE";
+    rs.className = "runstate live";
+  }
+  var btns = $("speeds").querySelectorAll("button");
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].className =
+      state.speed !== null && Math.abs(parseFloat(btns[i].dataset.v) -
+        state.speed) < 0.01 ? "on" : "";
+  }
+}
+
+/* ---- clock ---- */
+function drawClock() {
+  var t = displayTime();
+  var s = Math.floor(t), d = Math.floor(s / 86400);
+  var txt = "T+" + (d ? d + "d " : "") +
+    pad(Math.floor(s / 3600) % 24) + ":" + pad(Math.floor(s / 60) % 60) +
+    ":" + pad(s % 60);
+  $("clk").textContent = txt;
+  var sub = "orbit " + (t / PERIOD).toFixed(2) + " · tick " + state.tick;
+  if (EPOCH_MS !== null) {
+    sub += " · " + new Date(EPOCH_MS + t * 1000).toISOString()
+      .slice(0, 19).replace("T", " ") + " UTC";
+  }
+  if (state.speed === null) sub += " · max speed";
+  $("clksub").textContent = sub;
+}
+
+/* ---- stat tiles ---- */
+var TILES = [
+  { label: "Mode", make: function () {
+      var safe = lv("obc/safe_mode"), shed = lv("eps/shedding");
+      if (safe === null) return { v: "—", note: "", warn: false };
+      var v = safe >= 0.5 ? "SAFE" : "NOMINAL";
+      return { v: v, note: shed >= 0.5 ? "load shedding" : "",
+               warn: safe >= 0.5 || shed >= 0.5 };
+    } },
+  { label: "State of charge", make: function () {
+      var est = lv("eps/soc_est"), tru = lv("physics/soc_true");
+      return { v: est === null ? "—" : (est * 100).toFixed(1) + "%",
+               note: tru === null ? "" : "true " + (tru * 100).toFixed(1) + "%",
+               warn: tru !== null && tru < 0.3 };
+    } },
+  { label: "Body rate", make: function () {
+      var tru = lv("physics/rate_dps"), est = lv("adcs/rate_dps");
+      return { v: tru === null ? "—" : fmt(tru) + "°/s",
+               note: est === null ? "" : "ADCS believes " + fmt(est),
+               warn: tru !== null && tru > 2.0 };
+    } },
+  { label: "Power", make: function () {
+      var g = lv("physics/p_gen_w"), l = lv("physics/p_load_w");
+      return { v: g === null ? "—" : fmt(g) + " W in",
+               note: l === null ? "" : fmt(l) + " W out", warn: false };
+    } },
+  { label: "Data queue", make: function () {
+      var q = lv("comms/queue_mb"), dr = lv("comms/dropped_mb");
+      return { v: q === null ? "—" : fmt(q) + " MB",
+               note: dr > 0 ? fmt(dr) + " MB dropped" : "",
+               warn: dr > 0 };
+    } },
+  { label: "Ground archive", make: function () {
+      var a = lv("ground/archive_mb"), rej = lv("ground/frames_rejected");
+      return { v: a === null ? "—" : fmt(a) + " MB",
+               note: rej > 0 ? rej.toFixed(0) + " frames rejected" : "",
+               warn: false };
+    } },
+];
+TILES.forEach(function (tl) {
+  var t = div("tile", $("tiles"));
+  div("lb", t, tl.label);
+  tl.vEl = div("vl", t, "—");
+  tl.nEl = div("nt", t, "");
+});
+function drawTiles() {
+  TILES.forEach(function (tl) {
+    var r = tl.make();
+    tl.vEl.textContent = r.v;
+    tl.vEl.className = "vl" + (r.warn ? " warn" : "");
+    tl.nEl.textContent = r.note;
+  });
+}
+
+/* ---- state pills ---- */
+BOOT.pills.forEach(function (p) {
+  p.el = div("pill", $("pills"), p.label);
+  p.k = p.source + "/" + p.key;
+});
+function drawPills() {
+  BOOT.pills.forEach(function (p) {
+    var v = lv(p.k);
+    p.el.className = "pill" + (v !== null && v >= 0.5 ? " on" : "");
+  });
+}
+
+/* ---- telemetry lanes ---- */
+BOOT.lanes.forEach(function (spec) {
+  var host = div("lane", $("lanes"));
+  var head = div("lane-head", host);
+  div("t", head, spec.title);
+  div("u", head, spec.unit);
+  var legend = div("legend", head);
+  var canvas = document.createElement("canvas");
+  host.appendChild(canvas);
+  var lane = { spec: spec, canvas: canvas, series: [] };
+  spec.series.forEach(function (s, i) {
+    var item = document.createElement("span");
+    var key = document.createElement("span");
+    key.className = "key";
+    key.style.borderTopColor = "var(" + SCOL[i % 4] + ")";
+    item.appendChild(key);
+    var txt = document.createTextNode(s.label + " —");
+    item.appendChild(txt);
+    legend.appendChild(item);
+    var buf = { pts: [], tf: s.tf, label: s.label, txt: txt };
+    lane.series.push(buf);
+    var k = s.source + "/" + s.key;
+    (laneIndex[k] = laneIndex[k] || []).push(buf);
+  });
+  lanes.push(lane);
+});
+function tfApply(tf, v) { return tf === "kelvin" ? v - 273.15 : v; }
+function drawLane(lane) {
+  var c = lane.canvas, w = c.parentNode.clientWidth - 4;
+  if (w < 40) return;
+  var H = 74, dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(H * dpr);
+    c.style.width = w + "px"; c.style.height = H + "px";
+  }
+  var ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, H);
+  var t1 = displayTime(), t0 = t1 - WIN;
+  var lo, hi;
+  if (lane.spec.domain) { lo = lane.spec.domain[0]; hi = lane.spec.domain[1]; }
+  else {
+    lo = Infinity; hi = -Infinity;
+    lane.series.forEach(function (s) {
+      for (var i = 0; i < s.pts.length; i += 2) {
+        if (s.pts[i] < t0) continue;
+        var v = s.pts[i + 1];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    });
+    if (lo > hi) { lo = 0; hi = 1; }
+    if (hi - lo < 1e-9) { hi += 0.5; lo -= 0.5; }
+    var padv = (hi - lo) * 0.08;
+    lo -= padv; hi += padv;
+  }
+  var gridc = css("--grid");
+  ctx.strokeStyle = gridc; ctx.lineWidth = 1;
+  [0, 0.5, 1].forEach(function (fr) {
+    var y = 4 + (H - 8) * fr;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  });
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.fillStyle = css("--muted");
+  ctx.fillText(fmt(hi), 3, 12);
+  ctx.fillText(fmt(lo), 3, H - 5);
+  function X(t) { return (t - t0) / WIN * w; }
+  function Y(v) {
+    var f = (v - lo) / (hi - lo);
+    return 4 + (H - 8) * (1 - Math.max(0, Math.min(1, f)));
+  }
+  lane.series.forEach(function (s, i) {
+    ctx.strokeStyle = css(SCOL[i % 4]);
+    ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    var pen = false, lastV = null;
+    for (var j = 0; j < s.pts.length; j += 2) {
+      var t = s.pts[j], v = s.pts[j + 1];
+      if (t < t0 - 60) continue;
+      if (pen) ctx.lineTo(X(t), Y(v));
+      else { ctx.moveTo(X(t), Y(v)); pen = true; }
+      lastV = v;
+    }
+    ctx.stroke();
+    s.txt.textContent = s.label + " " + fmt(lastV);
+  });
+}
+function drawLanes() { lanes.forEach(drawLane); }
+window.addEventListener("resize", drawLanes);
+
+/* ---- all-telemetry table ---- */
+function drawAllTable() {
+  if (!$("alltlm").open) return;
+  var keys = Object.keys(latest).sort();
+  var tb = $("alltbl").tBodies[0];
+  tb.textContent = "";
+  var now = displayTime();
+  keys.forEach(function (k) {
+    var tr = tb.insertRow();
+    var s = k.split("/");
+    tr.insertCell().textContent = s[0];
+    tr.insertCell().textContent = s.slice(1).join("/");
+    var c = tr.insertCell(); c.className = "num";
+    c.textContent = fmt(latest[k][1]);
+    var a = tr.insertCell(); a.className = "num";
+    a.textContent = fmt(Math.max(0, now - latest[k][0])) + " s";
+  });
+}
+
+/* ---- bus monitor ---- */
+function busUpdate(m) {
+  var k = m.topic + "|" + m.sender;
+  var e = bus[k];
+  if (!e) {
+    e = bus[k] = { topic: m.topic, sender: m.sender, times: [] };
+    var tb = $("bustbl").tBodies[0];
+    // keep rows sorted by topic so the table never jumps around
+    var rows = tb.rows, at = rows.length;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.k > k) { at = i; break; }
+    }
+    var tr = tb.insertRow(at);
+    tr.dataset.k = k;
+    e.tr = tr;
+    var dcell = tr.insertCell();
+    e.dot = document.createElement("span");
+    e.dot.className = "dot";
+    dcell.appendChild(e.dot);
+    tr.insertCell().textContent = m.topic;
+    tr.insertCell().textContent = m.sender;
+    e.rate = tr.insertCell(); e.rate.className = "num";
+    e.pay = tr.insertCell(); e.pay.className = "mono";
+    tr.addEventListener("click", function () { pin(e.topic); });
+    applyFilter(tr);
+  }
+  e.times.push(m.t);
+  if (e.times.length > 6) e.times.shift();
+  var n = e.times.length;
+  e.rate.textContent = n > 1 && e.times[n - 1] > e.times[0]
+    ? (60 * (n - 1) / (e.times[n - 1] - e.times[0])).toFixed(1) + "/min"
+    : "—";
+  var pj = JSON.stringify(m.data);
+  e.pay.textContent = pj.length > 160 ? pj.slice(0, 157) + "…" : pj;
+  e.pay.title = "t=" + m.t;
+  e.dot.classList.remove("ping");
+  void e.dot.offsetWidth;
+  e.dot.classList.add("ping");
+  if (pinned === e.topic) tailPush(m);
+}
+function applyFilter(tr) {
+  var q = $("busfilter").value.trim();
+  tr.style.display = !q || tr.dataset.k.indexOf(q) !== -1 ? "" : "none";
+}
+$("busfilter").addEventListener("input", function () {
+  var rows = $("bustbl").tBodies[0].rows;
+  for (var i = 0; i < rows.length; i++) applyFilter(rows[i]);
+});
+function pin(topic) {
+  pinned = topic;
+  $("tailwrap").style.display = "";
+  $("tailtitle").textContent = "tailing " + topic;
+  $("tail").textContent = "";
+  var rows = $("bustbl").tBodies[0].rows;
+  for (var i = 0; i < rows.length; i++) {
+    rows[i].className =
+      rows[i].dataset.k.split("|")[0] === topic ? "pinned" : "";
+  }
+}
+$("tailclose").addEventListener("click", function () {
+  pinned = null;
+  $("tailwrap").style.display = "none";
+  var rows = $("bustbl").tBodies[0].rows;
+  for (var i = 0; i < rows.length; i++) rows[i].className = "";
+});
+function pushFeed(host, node, cap) {
+  var stick =
+    host.scrollTop + host.clientHeight >= host.scrollHeight - 12;
+  host.appendChild(node);
+  while (host.childNodes.length > cap) host.removeChild(host.firstChild);
+  if (stick) host.scrollTop = host.scrollHeight;
+}
+function tailPush(m) {
+  var line = document.createElement("div");
+  line.textContent = "orbit " + (m.t / PERIOD).toFixed(3) + "  [" +
+    m.sender + "] " + JSON.stringify(m.data);
+  pushFeed($("tail"), line, 300);
+}
+
+/* ---- link monitor ---- */
+function linkPush(m) {
+  var line = document.createElement("div");
+  var txt = m.link;
+  line.className = "linkline" +
+    (txt.indexOf("**") !== -1 ? " bad" : txt.indexOf("UP") === 0 ? " up" : "");
+  txt = txt.replace(/^DOWN/, "↓").replace(/^UP\* /, "↑* ")
+           .replace(/^UP {2}/, "↑  ");
+  line.textContent = "orbit " + (m.t / PERIOD).toFixed(3) + "  " + txt;
+  pushFeed($("link"), line, 250);
+}
+
+/* ---- event ticker ---- */
+function evPush(ev) {
+  var line = div("ev", null);
+  var dot = document.createElement("span");
+  dot.className = "sev";
+  var col = { good: "--good", warning: "--warning",
+              critical: "--critical" }[ev.sev] || "--muted";
+  dot.style.background = "var(" + col + ")";
+  line.appendChild(dot);
+  var b = document.createElement("b");
+  b.textContent = ev.source + " " + ev.kind;
+  line.appendChild(document.createTextNode(
+    "orbit " + (ev.t / PERIOD).toFixed(2) + " · "));
+  line.appendChild(b);
+  if (ev.detail) line.appendChild(document.createTextNode(" " + ev.detail));
+  var host = $("events");
+  host.insertBefore(line, host.firstChild);
+  while (host.childNodes.length > 300) host.removeChild(host.lastChild);
+}
+
+/* ---- orbit globe (adapted from the flight-report dashboard) ---- */
+var globe = (function () {
+  var host = $("orbit"), O = BOOT.orbit3d;
+  var canvas = document.createElement("canvas");
+  host.appendChild(canvas);
+  var vs = { yaw: -0.9, pitch: 0.38 };
+  var W = 0, H = 0, cx = 0, cy = 0, sc = 1, ctx = null;
+  function size() {
+    var w = host.clientWidth;
+    if (w < 40) return false;
+    var h = Math.max(220, Math.min(400, Math.round(w * 0.62)));
+    var dpr = window.devicePixelRatio || 1;
+    if (W !== w || H !== h) {
+      W = w; H = h;
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+      canvas.style.width = w + "px"; canvas.style.height = h + "px";
+      cx = W / 2; cy = H / 2;
+      sc = (Math.min(W, H) / 2 - 8) / 1.32;
+      ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    return true;
+  }
+  function rot(v) {
+    var c = Math.cos(vs.yaw), sn = Math.sin(vs.yaw);
+    var x = v[0] * c - v[1] * sn, y = v[0] * sn + v[1] * c, z = v[2];
+    var cp = Math.cos(vs.pitch), sp = Math.sin(vs.pitch);
+    return [x, y * cp - z * sp, y * sp + z * cp];
+  }
+  function P(v) {
+    var r = rot(v);
+    return { x: cx + r[0] * sc, y: cy - r[2] * sc, d: -r[1] };
+  }
+  function satPos(t) {
+    var u = O.n_rad_s * t, cu = Math.cos(u), su = Math.sin(u),
+        R = O.r_orbit_re;
+    return [R * (cu * O.e1[0] + su * O.e2[0]),
+            R * (cu * O.e1[1] + su * O.e2[1]),
+            R * (cu * O.e1[2] + su * O.e2[2])];
+  }
+  function siteEci(lat, lon, t) {
+    var la = lat * Math.PI / 180;
+    var lo = lon * Math.PI / 180 + O.gmst0_rad + O.w_earth_rad_s * t;
+    return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
+            Math.sin(la)];
+  }
+  function latLon(lat, lon) {
+    var la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
+    return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
+            Math.sin(la)];
+  }
+  function occluded(p) {
+    var dx = p.x - cx, dy = p.y - cy;
+    return p.d < 0 && (dx * dx + dy * dy) < (sc * 0.998) * (sc * 0.998);
+  }
+  function inShadow(r) {  // cylindrical Earth shadow, r in Earth radii
+    var d = r[0] * O.sun[0] + r[1] * O.sun[1] + r[2] * O.sun[2];
+    if (d >= 0) return false;
+    var px = r[0] - d * O.sun[0], py = r[1] - d * O.sun[1],
+        pz = r[2] - d * O.sun[2];
+    return px * px + py * py + pz * pz < 1.0;
+  }
+  function polyline(pts, filter, color, width, alpha) {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    var pen = false;
+    for (var i = 0; i < pts.length; i++) {
+      if (filter(pts[i])) {
+        if (pen) ctx.lineTo(pts[i].x, pts[i].y);
+        else { ctx.moveTo(pts[i].x, pts[i].y); pen = true; }
+      } else pen = false;
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  var PERIOD_O = 2 * Math.PI / O.n_rad_s;
+  function render(t) {
+    if (!size()) return;
+    ctx.clearRect(0, 0, W, H);
+    var grid = css("--grid"), axis = css("--axis"), s1 = css("--s1"),
+        s2 = css("--s2"), s3 = css("--s3"), s4 = css("--s4"),
+        serious = css("--serious"), ink2 = css("--ink-2"),
+        surface = css("--surface");
+    var gmst = O.gmst0_rad + O.w_earth_rad_s * t;
+    var lonOff = gmst * 180 / Math.PI;
+    function earthPt(lat, lon) { return P(latLon(lat, lon + lonOff)); }
+
+    var lines = [];
+    for (var lon = 0; lon < 180; lon += 30) {
+      var pts = [];
+      for (var a = 0; a <= 360; a += 5) {
+        var la = (a <= 180 ? a - 90 : 270 - a);
+        pts.push(earthPt(la, a <= 180 ? lon : lon + 180));
+      }
+      lines.push(pts);
+    }
+    [-60, -30, 0, 30, 60].forEach(function (lat) {
+      var pts = [];
+      for (var b = 0; b <= 360; b += 5) pts.push(earthPt(lat, b));
+      lines.push(pts);
+    });
+    lines.forEach(function (pts) {
+      polyline(pts, function (p) { return p.d < 0; }, grid, 1, 0.45);
+    });
+    ctx.fillStyle = css("--band");
+    ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.fill();
+    var sv = rot(O.sun), sl = Math.hypot(sv[0], sv[2]) || 1;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.clip();
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.atan2(-sv[2], sv[0]) + Math.PI);
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    ctx.fillRect(0, -sc, sc, 2 * sc);
+    ctx.restore();
+    lines.forEach(function (pts) {
+      polyline(pts, function (p) { return p.d >= 0; }, grid, 1, 0.9);
+    });
+    ctx.strokeStyle = axis; ctx.lineWidth = 1; ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.stroke();
+
+    var saa = [];
+    var la0 = O.saa.lat[0], la1 = O.saa.lat[1],
+        lo0 = O.saa.lon[0], lo1 = O.saa.lon[1], k;
+    for (k = lo0; k <= lo1; k += 5) saa.push(earthPt(la1, k));
+    for (k = la1; k >= la0; k -= 5) saa.push(earthPt(k, lo1));
+    for (k = lo1; k >= lo0; k -= 5) saa.push(earthPt(la0, k));
+    for (k = la0; k <= la1; k += 5) saa.push(earthPt(k, lo0));
+    polyline(saa, function (p) { return p.d >= 0; }, serious, 1.4, 0.6);
+    var saaC = earthPt((la0 + la1) / 2, (lo0 + lo1) / 2);
+    if (saaC.d > 0.15) {
+      ctx.fillStyle = serious; ctx.globalAlpha = 0.75;
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText("SAA", saaC.x - 10, saaC.y + 3);
+      ctx.globalAlpha = 1;
+    }
+
+    // orbit ring, faded where the geometry says shadow
+    var t0ring = Math.floor(t / PERIOD_O) * PERIOD_O;
+    ctx.lineWidth = 2;
+    for (var i = 0; i < 180; i++) {
+      var ta = t0ring + (i / 180) * PERIOD_O,
+          tb = t0ring + ((i + 1) / 180) * PERIOD_O;
+      var ra = satPos(ta), rb = satPos(tb);
+      var pa = P(ra), pb = P(rb);
+      var hid = occluded(pa) || occluded(pb);
+      ctx.strokeStyle = s1;
+      ctx.globalAlpha = hid ? 0.10 : (inShadow(ra) ? 0.25 : 0.75);
+      ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    O.sites.forEach(function (site) {
+      var p = P(siteEci(site.lat, site.lon, t));
+      if (p.d <= 0) return;
+      var stn = site.kind === "station";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, stn ? 4.5 : 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = stn ? s2 : s3; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
+      ctx.fillStyle = ink2; ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText(site.name, p.x + 7, p.y + 3);
+    });
+
+    var rNow = satPos(t), sp = P(rNow);
+    ctx.lineWidth = 2; ctx.strokeStyle = s1;
+    var TRAIL = Math.min(t, PERIOD_O * 0.22);
+    for (var j = 0; j < 24; j++) {
+      var u0 = t - TRAIL * (1 - j / 24),
+          u1 = t - TRAIL * (1 - (j + 1) / 24);
+      var qa = P(satPos(u0)), qb = P(satPos(u1));
+      if (occluded(qa) || occluded(qb)) continue;
+      ctx.globalAlpha = 0.06 + 0.5 * (j / 24);
+      ctx.beginPath(); ctx.moveTo(qa.x, qa.y); ctx.lineTo(qb.x, qb.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    if (lv("physics/gs_contact") >= 0.5) {
+      var stn0 = O.sites[0], gp = P(siteEci(stn0.lat, stn0.lon, t));
+      ctx.strokeStyle = s2; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
+      ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(sp.x, sp.y);
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    ctx.globalAlpha = occluded(sp) ? 0.35 : 1;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = s1; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    var gx = cx + (sv[0] / sl) * sc * 1.22,
+        gy = cy - (sv[2] / sl) * sc * 1.22;
+    ctx.globalAlpha = -sv[1] >= 0 ? 0.95 : 0.55;
+    ctx.beginPath(); ctx.arc(gx, gy, 6, 0, 2 * Math.PI);
+    ctx.fillStyle = s4; ctx.fill();
+    for (var r8 = 0; r8 < 8; r8++) {
+      var an = r8 * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(gx + Math.cos(an) * 8, gy + Math.sin(an) * 8);
+      ctx.lineTo(gx + Math.cos(an) * 11, gy + Math.sin(an) * 11);
+      ctx.strokeStyle = s4; ctx.lineWidth = 1.4; ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    $("orbchip").textContent = "orbit " + (t / PERIOD_O).toFixed(2);
+    var ecl = inShadow(rNow);
+    $("eclchip").textContent = ecl ? "eclipse" : "sunlit";
+    $("eclchip").className = "chip" + (ecl ? "" : " on");
+    var con = lv("physics/gs_contact") >= 0.5;
+    $("conchip").textContent = con ? "in contact" : "no contact";
+    $("conchip").className = "chip" + (con ? " on" : "");
+    // sub-satellite point vs the SAA box (same box the fault injector uses)
+    var rl = Math.hypot(rNow[0], rNow[1], rNow[2]) || 1;
+    var rlat = Math.asin(rNow[2] / rl) * 180 / Math.PI;
+    var rlon = (Math.atan2(rNow[1], rNow[0]) - gmst) * 180 / Math.PI;
+    rlon = ((rlon % 360) + 540) % 360 - 180;
+    var saaNow = rlat >= la0 && rlat <= la1 && rlon >= lo0 && rlon <= lo1;
+    $("saachip").textContent = saaNow ? "in SAA" : "outside SAA";
+    $("saachip").className = "chip" + (saaNow ? " on" : "");
+  }
+  var dragging = false, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", function (ev) {
+    dragging = true; lx = ev.clientX; ly = ev.clientY;
+    canvas.setPointerCapture(ev.pointerId);
+  });
+  canvas.addEventListener("pointermove", function (ev) {
+    if (!dragging) return;
+    vs.yaw += (ev.clientX - lx) * 0.008;
+    vs.pitch = Math.max(-1.35,
+      Math.min(1.35, vs.pitch + (ev.clientY - ly) * 0.008));
+    lx = ev.clientX; ly = ev.clientY;
+    if (reduced) render(displayTime());
+  });
+  canvas.addEventListener("pointerup", function () { dragging = false; });
+  canvas.addEventListener("pointercancel", function () { dragging = false; });
+  return { render: render };
+})();
+
+/* ---- stream ---- */
+function apply(f) {
+  var st = f.status;
+  state.simTime = st.t; state.tick = st.tick; state.paused = st.paused;
+  state.speed = st.speed; state.done = st.done;
+  state.statusWall = performance.now();
+  (f.telemetry || []).forEach(function (row) {
+    var k = row[1] + "/" + row[2];
+    latest[k] = [row[0], row[3]];
+    var subs = laneIndex[k];
+    if (subs) {
+      for (var i = 0; i < subs.length; i++) {
+        subs[i].pts.push(row[0], tfApply(subs[i].tf, row[3]));
+      }
+    }
+  });
+  // evict lane points that scrolled out of the window
+  var cut = state.simTime - WIN - 120;
+  lanes.forEach(function (lane) {
+    lane.series.forEach(function (s) {
+      var i = 0;
+      while (i < s.pts.length && s.pts[i] < cut) i += 2;
+      if (i > 0) s.pts.splice(0, i);
+    });
+  });
+  (f.messages || []).forEach(function (m) {
+    busUpdate(m);
+    if (m.link) linkPush(m);
+  });
+  (f.events || []).forEach(evPush);
+  drawControls(); drawTiles(); drawPills(); drawLanes(); drawAllTable();
+  if (reduced) { drawClock(); globe.render(displayTime()); }
+}
+var es = new EventSource("/events");
+es.onmessage = function (e) { apply(JSON.parse(e.data)); };
+es.onopen = function () { $("conn").className = "conn ok"; };
+es.onerror = function () { $("conn").className = "conn err"; };
+
+if (!reduced) {
+  (function frame() {
+    drawClock();
+    globe.render(displayTime());
+    requestAnimationFrame(frame);
+  })();
+} else {
+  drawClock();
+  globe.render(0);
+}
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    main()

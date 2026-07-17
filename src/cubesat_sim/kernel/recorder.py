@@ -32,11 +32,23 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_key ON telemetry(source, key);
 
 class FlightRecorder:
     def __init__(self, path: str | Path | None = None) -> None:
-        self._conn = sqlite3.connect(str(path) if path is not None else ":memory:")
+        # check_same_thread=False: live mode builds the sim on the main
+        # thread but steps it on a worker; the connection is handed over
+        # sequentially, never used from two threads at once
+        self._conn = sqlite3.connect(
+            str(path) if path is not None else ":memory:",
+            check_same_thread=False)
         self._conn.executescript(_SCHEMA)
         self._messages: list[tuple] = []
         self._telemetry: list[tuple] = []
         self._events: list[tuple] = []
+
+    def enable_wal(self) -> None:
+        """Switch the recording to WAL journaling. Live mode tails the file
+        from other connections while this one writes; WAL lets readers see
+        each committed tick without blocking (or being blocked by) the
+        writer. No effect on in-memory recordings."""
+        self._conn.execute("PRAGMA journal_mode=WAL")
 
     def set_meta(self, **kv: Any) -> None:
         self._conn.executemany(

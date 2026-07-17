@@ -80,6 +80,23 @@ def _fmt_tc(data: dict, direction: str, show_hex: bool) -> str:
     return out
 
 
+def describe_link_message(topic: str, data: dict,
+                          show_hex: bool = False) -> str | None:
+    """One-line human decode of a link-layer bus message, or None when the
+    (topic, payload) pair isn't link traffic this analyzer understands.
+    Shared by the CLI dump below and the live console's link monitor."""
+    kind = data.get("kind")
+    if topic == "radio/rx_ground" and kind == "tm_frame":
+        return _fmt_tm(data, show_hex)
+    if topic == "radio/rx_ground" and kind == "vc1_burst":
+        return _fmt_vc1(data)
+    if topic == "ground/tx" and "hex" in data:
+        return _fmt_tc(data, "UP  ", show_hex)
+    if topic == "radio/rx_space" and "hex" in data:
+        return _fmt_tc(data, "UP* ", show_hex)  # * = after the channel
+    return None
+
+
 def dump(db_path: str, limit: int | None = None, show_hex: bool = False) -> str:
     period = CircularOrbit().period_s
     db = sqlite3.connect(db_path)
@@ -96,22 +113,19 @@ def dump(db_path: str, limit: int | None = None, show_hex: bool = False) -> str:
     for t, topic, blob in rows:
         data = json.loads(blob)
         kind = data.get("kind")
-        if topic == "radio/rx_ground" and kind == "tm_frame":
-            text = _fmt_tm(data, show_hex)
+        text = describe_link_message(topic, data, show_hex)
+        if text is None:
+            text = f"{topic} {blob[:60]}"
+        elif topic == "radio/rx_ground" and kind == "tm_frame":
             stats["tm_bad" if "FAIL" in text or "LOST" in text
                   else "tm_ok"] += 1
         elif topic == "radio/rx_ground" and kind == "vc1_burst":
-            text = _fmt_vc1(data)
             stats["vc1_frames"] += int(data.get("frames", 0))
             stats["vc1_bad"] += int(data.get("bad", 0))
-        elif topic == "ground/tx" and "hex" in data:
-            text = _fmt_tc(data, "UP  ", show_hex)
+        elif topic == "ground/tx":
             stats["tc_sent"] += 1
-        elif topic == "radio/rx_space" and "hex" in data:
-            text = _fmt_tc(data, "UP* ", show_hex)  # * = after the channel
+        elif topic == "radio/rx_space":
             stats["tc_received"] += 1
-        else:
-            text = f"{topic} {blob[:60]}"
         lines.append(f"orbit {t / period:6.2f}  t={t:8.0f}  {text}")
 
     lines.append("")

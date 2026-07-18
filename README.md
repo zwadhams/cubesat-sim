@@ -128,24 +128,54 @@ Rules of the house:
 
 ## Getting started
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-make -C c/obc                                  # C flight software (OBC)
-make -C c/eps                                  # C flight software (EPS)
-make -C cpp/comms                              # C++ flight software (comms)
-cargo build --release --manifest-path rust/adcs/Cargo.toml   # Rust ADCS
-.venv/bin/pytest
-.venv/bin/python examples/phase6_link_demo.py
-.venv/bin/python -m cubesat_sim.dashboard runs/phase6_link.db   # -> .html report
-.venv/bin/python -m cubesat_sim.linkdump runs/phase6_link.db    # decode the link
+**Prerequisites:** Python 3.11+, plus the toolchains for the compiled
+flight software — [Rust](https://rustup.rs) (`cargo`) and a C/C++
+compiler with `make` (on Debian/Ubuntu, `sudo apt install build-essential`).
 
-# fly live and watch at http://localhost:8765 (60x wall clock, faults on)
+**1. Install.** [uv](https://docs.astral.sh/uv/) is the easy path — it
+creates the virtualenv and installs everything, no system `pip` required:
+
+```bash
+uv venv
+uv pip install -e ".[dev]"
+```
+
+Prefer the standard library? `python3 -m venv .venv && .venv/bin/pip install
+-e ".[dev]"` works whenever your Python ships `pip`.
+
+**2. Build the flight software** (ADCS in Rust, comms in C++, plus C builds
+of the OBC and EPS):
+
+```bash
+make -C c/obc && make -C c/eps && make -C cpp/comms
+cargo build --release --manifest-path rust/adcs/Cargo.toml
+```
+
+**3. Run the tests, fly a demo, and open the report:**
+
+```bash
+.venv/bin/pytest                                      # ~4 min, all green
+.venv/bin/python examples/phase6_link_demo.py         # -> runs/phase6_link.db
+.venv/bin/python -m cubesat_sim.dashboard runs/phase6_link.db  # -> runs/phase6_link.html
+```
+
+Open `runs/phase6_link.html` in any browser — a self-contained flight
+report. Hover any acronym for a definition, and read the **What happened**
+card for auto-detected findings, each linked to the behavior catalog.
+Decode the space link with
+`.venv/bin/python -m cubesat_sim.linkdump runs/phase6_link.db`.
+
+**4. Fly one live** and watch it in the browser at http://localhost:8765:
+
+```bash
 .venv/bin/python -m cubesat_sim.live --seed 19 --orbits 4 --seu-rate 6 \
     --campaign --speed 60
-# or re-fly a finished recording the same way
-.venv/bin/python -m cubesat_sim.live --replay runs/mc/flight_0019.db --speed 120
 ```
+
+The live console is interactive: pause and change time-acceleration, and use
+the **Commanding** panel to uplink real telecommands, inject faults, or
+publish raw bus messages mid-flight — then watch the findings react. Re-fly
+any finished recording the same way with `--replay runs/phase6_link.db`.
 
 To fly with the C flight software instead of the Python references:
 `build_sim(obc_impl="c", eps_impl="c")`. Observed emergent behaviors are cataloged in

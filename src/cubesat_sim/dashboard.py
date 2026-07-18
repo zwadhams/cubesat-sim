@@ -10,8 +10,11 @@ browser; light/dark follow the OS with a manual toggle.
 The report teaches itself: GLOSSARY terms grow dotted-underline hover
 tooltips wherever they appear (tiles, hints, legends, row labels), the
 event log defines every event kind on hover via EVENT_GLOSS, and the
-primer opens with the system in one minute. The goal is that a reader
-can learn the whole spacecraft without leaving the page.
+primer opens with the system in one minute. `_annotations` runs the
+emergent-behavior catalog's signatures against the flight and writes a
+plain-language "What happened" card, each finding click-to-zoom onto its
+evidence. The goal is that a reader can learn the whole spacecraft, and
+what this particular flight did, without leaving the page.
 
 Usage:
     python -m cubesat_sim.dashboard runs/phase5_hard_failure.db
@@ -372,6 +375,173 @@ def _intervals(points, t_end: float):
     return out
 
 
+def _overlap(iv_a, iv_b):
+    """Total seconds where intervals from list A overlap intervals in B."""
+    total = 0.0
+    for a0, a1 in iv_a:
+        for b0, b1 in iv_b:
+            total += max(0.0, min(a1, b1) - max(a0, b0))
+    return total
+
+
+def _annotations(evs, tracks_map, bag, t_end, period) -> list[dict]:
+    """Auto-detected signatures: run the emergent-behavior catalog's
+    known mechanisms against this flight and write a sentence for each
+    match, anchored to a time span the reader can zoom to. Detectors are
+    deliberately conservative — a finding must be cheap to verify by eye
+    in the charts right below it."""
+    notes: list[dict] = []
+
+    def note(sev, t0, t1, text):
+        notes.append({"sev": sev, "t0": _round(max(0.0, t0)),
+                      "t1": _round(min(t_end, max(t0, t1))), "text": text})
+
+    def orb(t):
+        return f"{t / period:.2f}"
+
+    # -- FDIR giveup, classified by which side of the mode gate the gyro
+    #    froze on (catalog entries 7 and 10) ------------------------------
+    giveups = [e for e in evs if e[2] == "fdir_giveup"]
+    if giveups:
+        tg = giveups[0][0]
+        est_tail = [v for t, v in bag.get("rate_est", []) if t > tg]
+        true_tail = [v for t, v in bag.get("rate_true", []) if t > tg]
+        # "frozen" tolerates cross-language float wobble in norm(gyro):
+        # a latched sensor reads a near-constant word, not a bit-exact one
+        frozen = (len(est_tail) >= 2
+                  and max(est_tail) - min(est_tail) < 0.02)
+        est_last = est_tail[-1] if est_tail else 0.0
+        true_last = true_tail[-1] if true_tail else 0.0
+        if est_tail and max(est_tail) <= 0.5 and true_last > 2.0:
+            # belief (calm) and truth (tumbling) diverged: the confident
+            # corpse — a gyro stuck below the gate, locked into sun-point
+            note("critical", tg, t_end,
+                 f"FDIR gave up at orbit {orb(tg)} with the ADCS reporting "
+                 f"{est_last:.2f} deg/s — below every mode gate, so it stayed "
+                 f"locked in sun-point with a dead damping term and pumped the "
+                 f"true rate to {true_last:.1f} deg/s. The watchdog checks the "
+                 f"same frozen word, so nothing on board can know (catalog "
+                 f"entry 10).")
+        elif frozen and est_last > 0.5:
+            note("critical", tg, t_end,
+                 f"FDIR gave up at orbit {orb(tg)} on a gyro frozen at "
+                 f"{est_last:.2f} deg/s — above the detumble-exit gate, so "
+                 f"sun-point never engages again and the power budget runs a "
+                 f"structural deficit (catalog entry 7).")
+        else:
+            note("critical", tg, t_end,
+                 f"FDIR exhausted its three ADCS power cycles at orbit "
+                 f"{orb(tg)} and gave up; the ADCS flies on whatever the "
+                 f"gyro reports now.")
+
+    # -- recovery that worked ---------------------------------------------
+    cleared = [e for e in evs if e[2] == "latchup_cleared"]
+    if cleared:
+        note("good", cleared[0][0], cleared[-1][0],
+             f"FDIR recovery worked as designed: {len(cleared)} soft "
+             f"latch-up(s) cleared by power-cycling the ADCS rail.")
+
+    # -- SEU flips the mode switch (catalog entry 12) ---------------------
+    flips = [e for e in evs if e[2] == "mode_change"
+             and e[3].get("to") == "NOMINAL"
+             and float(e[3].get("soc_est", 0.0)) >= 0.999]
+    if flips:
+        note("warning", flips[0][0], flips[-1][0],
+             f"radiation toggled the mode switch ×{len(flips)}: a SEU "
+             f"saturated the SoC estimate to exactly 1.0 for one sample, "
+             f"and the un-debounced SAFE-exit gate believed it — payload "
+             f"commanded on mid-crisis (catalog entry 12).")
+
+    # -- the shed one-way door (catalog entry 6) --------------------------
+    shed_iv = tracks_map.get("load shed", [])
+    if shed_iv and shed_iv[-1][1] >= t_end - 60.0 \
+            and shed_iv[-1][1] - shed_iv[-1][0] > period:
+        a = shed_iv[-1][0]
+        facing = [v for t, v in bag.get("sun_facing", []) if t > a]
+        if facing and sum(facing) / len(facing) < 0.0:
+            note("critical", a, t_end,
+                 f"the EPS shed at orbit {orb(a)} latched to the end of the "
+                 f"flight: the freewheeling satellite settled anti-sun, "
+                 f"generation pinned at the side-panel floor, and the "
+                 f"estimate can never climb back over the restore threshold "
+                 f"— the one-way door (catalog entry 6).")
+        else:
+            note("warning", a, t_end,
+                 f"the EPS load shed at orbit {orb(a)} never released — the "
+                 f"SoC estimate stayed below the restore threshold for the "
+                 f"rest of the flight.")
+
+    # -- cold-charge trap (catalog entry 3's ingredient) ------------------
+    inhib = tracks_map.get("charge inhibit", [])
+    eclipse = tracks_map.get("eclipse", [])
+    if inhib:
+        sunlit_blocked = sum(b - a for a, b in inhib) - _overlap(inhib, eclipse)
+        if sunlit_blocked > 300.0:
+            note("warning", inhib[0][0], inhib[-1][1],
+                 f"sun on the panel, charging physically blocked: the "
+                 f"battery sat below the li-ion 0 °C limit for "
+                 f"{sunlit_blocked / 60.0:.0f} sunlit minutes while loads "
+                 f"kept draining (catalog entry 3's trap).")
+
+    # -- brownout ---------------------------------------------------------
+    brs = [e for e in evs if e[2] == "brownout"]
+    if brs:
+        note("critical", brs[0][0], brs[-1][0],
+             f"the battery hit empty at orbit {orb(brs[0][0])} — every "
+             f"protection upstream of this either fired or was defeated.")
+
+    # -- the watchdog's blind spot (catalog entry 8) ----------------------
+    mag_stuck = [e for e in evs if e[2] == "inject"
+                 and e[3].get("sensor") == "mag" and e[3].get("stuck")]
+    fdir_ts = [e[0] for e in evs if e[2] == "fdir_adcs_power_cycle"]
+    for m in mag_stuck:
+        if not any(abs(ft - m[0]) < 600.0 for ft in fdir_ts):
+            note("warning", m[0], m[0],
+                 f"a magnetometer latch-up at orbit {orb(m[0])} passed "
+                 f"unnoticed — the watchdog only monitors the gyro; a "
+                 f"tumbling satellite with a frozen mag cannot detumble and "
+                 f"nothing on board would know (catalog entry 8).")
+            break
+
+    # -- ground veto latch (catalog entry 11) -----------------------------
+    dis = [e for e in evs if e[2] == "operator_disable_payload"]
+    ena = [e for e in evs if e[2] == "operator_enable_payload"]
+    if dis and (not ena or ena[-1][0] < dis[-1][0]):
+        td = dis[-1][0]
+        targets = [iv for iv in tracks_map.get("target visible", [])
+                   if iv[0] > td]
+        imaged = [iv for iv in tracks_map.get("imaging", []) if iv[0] > td]
+        if targets and not imaged and t_end - td > period:
+            note("warning", td, t_end,
+                 f"the ground's payload veto latched at orbit {orb(td)} and "
+                 f"never released — {len(targets)} target pass(es) went "
+                 f"unimaged. Re-enable requires hearing a healthy estimate "
+                 f"during a pass, and a sagging estimator never delivers "
+                 f"one (catalog entry 11).")
+
+    # -- eclipse-phase-locked limit cycle (catalog entry 1) ---------------
+    safe_iv = tracks_map.get("safe mode", [])
+    if len(safe_iv) >= 3:
+        starts = [a for a, _ in safe_iv]
+        gaps = [y - x for x, y in zip(starts, starts[1:])]
+        if gaps and all(0.6 * period < g < 1.4 * period for g in gaps):
+            note("warning", safe_iv[0][0], safe_iv[-1][1],
+                 f"a SAFE/NOMINAL limit cycle phase-locked to the eclipse "
+                 f"cycle (×{len(safe_iv)}, ~once per orbit): voltage sag "
+                 f"biases the SoC estimate low in eclipse, turning the "
+                 f"hysteresis band into an oscillator (catalog entry 1).")
+
+    # -- bridge quarantine ------------------------------------------------
+    rej = [e for e in evs if e[2] in ("pub_reject", "telemetry_reject")]
+    if rej:
+        note("warning", rej[0][0], rej[-1][0],
+             f"the bridge quarantined {len(rej)} poison value(s) from "
+             f"flight software — JSON null / non-finite words rejected "
+             f"before they could reach the bus (catalog entry 9).")
+
+    return sorted(notes, key=lambda n: n["t0"])
+
+
 def _fmt_detail(detail: dict) -> str:
     parts = []
     for k, v in detail.items():
@@ -380,6 +550,36 @@ def _fmt_detail(detail: dict) -> str:
         else:
             parts.append(f"{k}={v}")
     return ", ".join(parts)
+
+
+def compute_annotations(db: sqlite3.Connection, t_end: float,
+                        period: float) -> list[dict]:
+    """Run the catalog-signature detectors against an open recording.
+    Shared by the flight report and the live console (which recomputes it
+    as the flight grows, treating 'now' as the end)."""
+    raw_events = [
+        (t, source, kind, json.loads(detail) if detail else {})
+        for t, source, kind, detail in db.execute(
+            "SELECT time, source, kind, detail FROM events "
+            "WHERE time <= ? ORDER BY tick", (t_end,))]
+    tracks_map = {}
+    for source, key, label in DIGITAL_TRACKS:
+        pts = [(t, v) for t, v in db.execute(
+            "SELECT time, value FROM telemetry WHERE source=? AND key=? "
+            "AND time <= ? ORDER BY tick", (source, key, t_end))
+            if v is not None]
+        iv = _intervals(pts, t_end)
+        if iv:
+            tracks_map[label] = iv
+    bag = {}
+    for name, source, key in (("rate_true", "physics", "rate_dps"),
+                              ("rate_est", "adcs", "rate_dps"),
+                              ("sun_facing", "physics", "sun_facing")):
+        bag[name] = [(t, v) for t, v in db.execute(
+            "SELECT time, value FROM telemetry WHERE source=? AND key=? "
+            "AND time <= ? ORDER BY tick", (source, key, t_end))
+            if v is not None]
+    return _annotations(raw_events, tracks_map, bag, t_end, period)
 
 
 def load_flight(db_path: str | Path) -> dict:
@@ -465,6 +665,7 @@ def load_flight(db_path: str | Path) -> dict:
                           "note": f"array at {illum[-1][1]:.3f}"})
 
         epoch_iso = json.loads(meta["epoch"]) if "epoch" in meta else None
+        annotations = compute_annotations(db, t_end, period)
 
         return {
             "title": db_path.stem,
@@ -475,6 +676,7 @@ def load_flight(db_path: str | Path) -> dict:
             "tracks": tracks,
             "events": events,
             "lanes": lanes,
+            "annotations": annotations,
             "orbit3d": _orbit_geometry(epoch_iso),
             "gloss": GLOSSARY,
             "evgloss": EVENT_GLOSS,
@@ -667,6 +869,21 @@ td.num { font-variant-numeric: tabular-nums; }
 svg text.hasdef { text-decoration: underline dotted; cursor: help; }
 #tooltip .tt-d { color: var(--ink-2); max-width: 300px; }
 #tooltip .tt-d b { color: var(--ink); }
+/* auto-detected findings */
+.findings { display: flex; flex-direction: column; gap: 0; }
+.finding { display: flex; gap: 10px; align-items: flex-start;
+           padding: 9px 6px; border-top: 1px solid var(--grid);
+           cursor: pointer; }
+.finding:first-child { border-top: none; }
+.finding:hover { background: var(--band); }
+.finding .fsev { flex: none; width: 9px; height: 9px; border-radius: 50%;
+                 margin-top: 5px; }
+.finding .ftext { flex: 1; color: var(--ink-2); }
+.finding .fwhen { flex: none; color: var(--muted); font-size: 11.5px;
+                  font-variant-numeric: tabular-nums; white-space: nowrap;
+                  margin-top: 1px; }
+.finding .zoomto { color: var(--s1); font-size: 11.5px; white-space: nowrap; }
+.findings-none { color: var(--muted); font-size: 12.5px; padding: 2px; }
 /* event-log severity filter chips */
 .evchips { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .evchip { font-size: 11.5px; color: var(--muted); border: 1px solid
@@ -698,10 +915,15 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
       everything interesting in this report is what happens when they
       interact.</p>
     <ul>
-      <li><strong>Top to bottom:</strong> headline numbers, the orbit
-        replay, on/off state channels, discrete events, then continuous
-        telemetry lanes. Everything shares one time axis, measured in
-        orbits (~94 min each).</li>
+      <li><strong>What happened</strong> lists the flight's story:
+        signatures the report auto-detected by running the
+        emergent-behavior catalog's known mechanisms against this
+        recording. Click one to zoom every chart to its evidence and
+        read it yourself.</li>
+      <li><strong>Top to bottom:</strong> headline numbers, the findings,
+        the orbit replay, on/off state channels, discrete events, then
+        continuous telemetry lanes. Everything shares one time axis,
+        measured in orbits (~94 min each).</li>
       <li><strong>Gray bands</strong> are eclipse (no sun, no power
         generation). <strong>Blue bands</strong> are ground-station
         contact — the only minutes when data goes down or commands go
@@ -723,6 +945,11 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
     <div class="gloss" id="gloss"></div>
   </details>
   <section class="tiles" id="tiles"></section>
+  <div class="card" id="findingscard">
+    <div class="card-head"><h2>What happened</h2>
+      <span class="zinfo">auto-detected from the flight — click one to zoom
+        the charts to it</span></div>
+    <div class="findings" id="findings"></div></div>
   <div class="card" id="orbitcard"><h2>Orbit</h2><div id="orbit"></div></div>
   <div class="card"><h2>State channels</h2><div id="xaxis-top"></div>
     <div id="tracks"></div></div>
@@ -1565,6 +1792,42 @@ function drawTiles() {
   });
   glossify(host);
 }
+/* auto-detected findings: the flight's story, each row a click-to-zoom
+   span. Rendered once (content is view-independent); the click drives
+   the same setView() the drag-zoom uses. */
+function drawFindings() {
+  var host = document.getElementById("findings");
+  host.textContent = "";
+  var notes = DATA.annotations || [];
+  if (!notes.length) {
+    var none = div("findings-none", host);
+    none.textContent = "No known signatures fired — a clean flight, or a "
+      + "new behavior the detectors don't recognize yet.";
+    document.getElementById("findingscard")
+      .querySelector(".zinfo").textContent = "auto-detected from the flight";
+    return;
+  }
+  notes.forEach(function (n) {
+    var row = div("finding", host);
+    var dot = div("fsev", row);
+    dot.style.background = SEV[n.sev] || SEV.neutral;
+    var body = div("ftext", row);
+    body.textContent = n.text;
+    var when = div("fwhen", row);
+    var span = n.t1 - n.t0;
+    when.textContent = span > PERIOD * 0.05
+      ? "orbit " + orbits(n.t0).toFixed(2) + "–" + orbits(n.t1).toFixed(2)
+      : "orbit " + orbits(n.t0).toFixed(2);
+    div("zoomto", row).textContent = "zoom ›";
+    row.addEventListener("click", function () {
+      var pad = Math.max(span * 0.15, PERIOD * 0.5);
+      setView(n.t0 - pad, n.t1 + pad);
+      document.getElementById("lanes").scrollIntoView(
+        { behavior: "smooth", block: "start" });
+    });
+  });
+  glossify(host);
+}
 var EVFILTER = { critical: true, warning: true, good: true, neutral: true };
 function drawEventTable() {
   var host = document.getElementById("evtable");
@@ -1665,6 +1928,7 @@ function buildAll() {
 /* one-time teaching chrome: the glossary grid, the primer text, the
    event count and severity-filter chips */
 (function () {
+  drawFindings();
   var grid = document.getElementById("gloss");
   Object.keys(GLOSS).forEach(function (k) {
     var b = document.createElement("b"); b.textContent = k;

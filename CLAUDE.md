@@ -82,6 +82,16 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
   recording to self-contained HTML; the live console (`cubesat_sim.live`)
   tails a recording over SSE — headless-browser screenshots cannot
   exercise SSE, drive real CDP if you need to verify the live page.
+- The teaching layer is shared by both viewers: `GLOSSARY` /
+  `EVENT_GLOSS` in `dashboard.py` are the single source of truth for
+  term tooltips and event definitions, shipped in both the report and
+  live-console boot payloads (the page-side `glossify` is duplicated in
+  each template — keep them in sync). `compute_annotations(db, t_end,
+  period)` runs the catalog-signature detectors; the report calls it
+  once, the live console re-runs it every ~3 s as the flight grows
+  (findings can refine/withdraw — honest for a live feed). Detectors
+  live in `_annotations`; each maps to a numbered EMERGENT_BEHAVIORS.md
+  entry and must stay cheap to verify by eye in the charts.
 - The live console's command panel (live flights only) posts
   `tc`/`inject` actions to `POST /control`; injections are queued and
   applied on the runner thread between ticks, and ground TCs ride

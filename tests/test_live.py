@@ -15,6 +15,8 @@ import urllib.request
 import pytest
 
 from cubesat_sim import Simulation, ccsds
+from cubesat_sim.environment.orbit import CircularOrbit
+from cubesat_sim.faults import sensor_stuck
 from cubesat_sim.ground.station import GroundStation
 from cubesat_sim.live import Console
 from cubesat_sim.mission import build_sim
@@ -219,6 +221,30 @@ def test_command_panel_reaches_the_sim(tmp_path):
             "SELECT COUNT(*) FROM events WHERE source='ground' "
             "AND kind='operator_manual_tc'").fetchone()[0] > 0
         ro.close()
+    finally:
+        con.stop()
+
+
+def test_findings_stream_over_replay(tmp_path):
+    """The console recomputes catalog-signature findings against the
+    recording and streams them. A flight with a magnetometer latch-up
+    trips the watchdog-blind-spot detector (entry 8), and the SSE stream
+    must carry it — same detectors as the flight-report dashboard."""
+    db = tmp_path / "flight.db"
+    period = CircularOrbit().period_s
+    sim = build_sim(dt=5.0, seed=7, recorder_path=db, adcs_impl="none",
+                    comms_impl="none", faults=[sensor_stuck(400.0, "mag")])
+    sim.run(duration=0.6 * period)
+    sim.close()
+
+    con = Console(replay=db, port=0, speed=math.inf).start()
+    try:
+        def has_entry8(frames):
+            return any("entry 8" in n["text"]
+                       for f in frames for n in f.get("findings", []))
+        with _get(con.url + "events", timeout=15.0) as resp:
+            frames = _read_until(resp, has_entry8)
+        assert has_entry8(frames)
     finally:
         con.stop()
 

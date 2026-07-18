@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cubesat_sim.dashboard import DIGITAL_TRACKS, ANALOG_LANES, _fmt_detail, \
-    _orbit_geometry, _severity
+from cubesat_sim.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
+    GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.linkdump import describe_link_message
 from cubesat_sim.mission import build_sim
@@ -163,6 +163,7 @@ def _boot_common(title: str, mode: str, meta: dict) -> dict:
         "lanes": _lane_specs(),
         "pills": [{"source": s, "key": k, "label": lb}
                   for s, k, lb in DIGITAL_TRACKS],
+        "gloss": GLOSSARY, "evgloss": EVENT_GLOSS,
     }
 
 
@@ -316,8 +317,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "telemetry": self._floor(db, "telemetry", now - LANE_WINDOW_S),
                 "events": 0,
             }
+            findings_state = {"last": None, "at": 0.0}
             while not self.ctl.stop:
                 frame, backlog = self._collect(db, cursors)
+                self._maybe_findings(db, frame, findings_state)
                 blob = json.dumps(frame, separators=(",", ":")).encode()
                 self.wfile.write(b"data: " + blob + b"\n\n")
                 self.wfile.flush()
@@ -327,6 +330,27 @@ class _Handler(BaseHTTPRequestHandler):
             pass  # client went away
         finally:
             db.close()
+
+    def _maybe_findings(self, db, frame, state) -> None:
+        """Recompute the catalog-signature findings against the recording
+        up to the current mission time, throttled to a few seconds so a
+        long flight doesn't rescan every poll. Only emitted when changed;
+        the client replaces its card wholesale. The detectors treat 'now'
+        as the end of flight, so a finding may appear, refine, or (rarely)
+        withdraw as more of the story lands — honest for a live feed."""
+        wall = _time.monotonic()
+        if state["last"] is not None and wall - state["at"] < 3.0:
+            return
+        state["at"] = wall
+        now = self.ctl.status()["t"]
+        try:
+            notes = compute_annotations(db, now + 1e-9, _PERIOD)
+        except sqlite3.Error:
+            return  # a mid-write read lost the race; try again next tick
+        key = json.dumps(notes, separators=(",", ":"))
+        if key != state["last"]:
+            state["last"] = key
+            frame["findings"] = notes
 
     @staticmethod
     def _floor(db, table: str, t: float) -> int:
@@ -696,6 +720,40 @@ details { margin: 10px 2px 0; color: var(--ink-2); }
 summary { cursor: pointer; font-size: 12.5px; }
 .overlay { text-align: center; color: var(--muted); font-size: 12.5px;
            padding: 8px 0 2px; }
+.card-head .zinfo { font-weight: 400; font-size: 11.5px; color: var(--muted); }
+/* primer + glossary (mirrors the flight-report dashboard) */
+.intro { background: var(--surface); border: 1px solid var(--border);
+         border-radius: 10px; padding: 4px 14px; margin: 0 0 12px;
+         color: var(--ink-2); font-size: 13px; }
+.intro summary { font-weight: 650; color: var(--ink); font-size: 13px;
+                 padding: 8px 0; cursor: pointer; }
+.intro p { margin: 6px 0 10px; }
+.intro .gloss { display: grid; grid-template-columns: max-content 1fr;
+                gap: 3px 12px; margin: 6px 0 12px; }
+.intro .gloss b { color: var(--ink); font-weight: 600; white-space: nowrap; }
+/* glossary terms: dotted underline, definition on hover/tap */
+.term { text-decoration: underline dotted var(--muted);
+        text-underline-offset: 2.5px; cursor: help; }
+#tooltip {
+  position: fixed; display: none; pointer-events: none; z-index: 20;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px; font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.13); max-width: 320px;
+}
+#tooltip .tt-t { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+#tooltip .tt-d { color: var(--ink-2); }
+#tooltip .tt-d b { color: var(--ink); }
+/* auto-detected findings */
+.findings { display: flex; flex-direction: column; gap: 0; }
+.finding { display: flex; gap: 10px; align-items: flex-start;
+           padding: 8px 4px; border-top: 1px solid var(--grid); }
+.finding:first-child { border-top: none; }
+.finding .fsev { flex: none; width: 9px; height: 9px; border-radius: 50%;
+                 margin-top: 5px; }
+.finding .ftext { flex: 1; color: var(--ink-2); }
+.finding .fwhen { flex: none; color: var(--muted); font-size: 11.5px;
+                  font-variant-numeric: tabular-nums; white-space: nowrap;
+                  margin-top: 1px; }
 </style>
 </head>
 <body>
@@ -706,6 +764,26 @@ summary { cursor: pointer; font-size: 12.5px; }
     <span class="conn" id="conn" title="stream"></span>
     <button id="themebtn" type="button">theme: auto</button>
   </header>
+
+  <details class="intro">
+    <summary>What am I looking at?</summary>
+    <p><strong>The spacecraft in one minute.</strong> The physics layer
+      holds the truth — orbit, attitude, battery, temperatures. No
+      subsystem sees it: they read noisy sensors and one-tick-stale bus
+      traffic, and each pursues its own local objective. The EPS
+      protects the battery (load shed), the OBC protects the mission
+      (safe mode, FDIR), the ADCS points the panel at the sun (that's
+      where the watts come from), thermal keeps the battery warm enough
+      to charge, the payload fills the data queue, and the ground —
+      seeing only what a pass lets through — commands the payload from
+      stale telemetry. Every protection is locally sensible; the
+      interesting behavior is what happens when they interact.</p>
+    <p>Dotted-underlined terms anywhere on this page show their
+      definition on hover (tap on a phone); event names do the same.
+      <strong>What happened</strong> lists signatures the console
+      auto-detects as the flight unfolds. The full glossary:</p>
+    <div class="gloss" id="gloss"></div>
+  </details>
 
   <div class="card cmdbar">
     <div class="clock">
@@ -719,6 +797,11 @@ summary { cursor: pointer; font-size: 12.5px; }
   </div>
 
   <div class="tiles" id="tiles"></div>
+
+  <div class="card" id="findingscard" style="display:none">
+    <div class="card-head"><h2>What happened</h2>
+      <span class="zinfo">auto-detected as the flight unfolds</span></div>
+    <div class="findings" id="findings"></div></div>
 
   <div class="duo">
     <div class="card">
@@ -799,6 +882,7 @@ summary { cursor: pointer; font-size: 12.5px; }
     <div class="cmdnote" id="cmdnote"></div>
   </div>
 </div>
+<div id="tooltip"></div>
 <script>
 "use strict";
 var BOOT = __BOOT__;
@@ -830,6 +914,140 @@ function fmt(v) {
   return v.toFixed(3);
 }
 function pad(n) { return (n < 10 ? "0" : "") + n; }
+function sevColor(sev) {
+  return css({ critical: "--critical", warning: "--warning",
+               good: "--good" }[sev] || "--muted");
+}
+
+/* ---- glossary: every term of art teaches itself on hover ----
+   Mirrors the flight-report dashboard. One dictionary (BOOT.gloss) feeds
+   the primer grid and dotted-underline .term spans wrapped around matches
+   in visible text; event kinds get BOOT.evgloss in the event feed. */
+var GLOSS = BOOT.gloss || {}, EVGLOSS = BOOT.evgloss || {};
+var ALIAS = { "ground contact": "pass", "load shed": "load shed" };
+var GLOSS_LC = {}, tooltip = $("tooltip"), termActive = false;
+function normTerm(s) { return String(s).toLowerCase().replace(/-/g, " "); }
+Object.keys(GLOSS).forEach(function (k) { GLOSS_LC[normTerm(k)] = k; });
+function defFor(name) {
+  var lc = normTerm(name);
+  if (ALIAS[lc]) lc = normTerm(ALIAS[lc]);
+  var k = GLOSS_LC[lc];
+  return k ? { name: k, def: GLOSS[k] } : null;
+}
+function termRegex(keys, flags) {
+  keys = keys.slice().sort(function (a, b) { return b.length - a.length; });
+  var alts = keys.map(function (k) {
+    return k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[ -]/g, "[ -]");
+  });
+  return new RegExp("(^|[^A-Za-z0-9_-])(" + alts.join("|") +
+                    ")((?:es|s)?)(?![A-Za-z0-9_-])", flags);
+}
+var _acr = [], _phr = [];
+Object.keys(GLOSS).forEach(function (k) {
+  (/[A-Z]/.test(k) ? _acr : _phr).push(k);
+});
+var reACR = _acr.length ? termRegex(_acr, "") : null;
+var rePHR = _phr.length ? termRegex(_phr, "i") : null;
+function glossifyNode(textNode) {
+  var s = textNode.nodeValue, out = [], pos = 0, hits = 0;
+  while (pos < s.length) {
+    var rest = s.slice(pos), bm = null, bat = Infinity;
+    [reACR, rePHR].forEach(function (re) {
+      if (!re) return;
+      var m = rest.match(re);
+      if (m && m.index + m[1].length < bat) { bat = m.index + m[1].length; bm = m; }
+    });
+    if (!bm) break;
+    var start = pos + bat, len = bm[2].length + bm[3].length;
+    var d = defFor(bm[2]);
+    if (d) {
+      out.push(s.slice(pos, start));
+      out.push({ text: s.slice(start, start + len), d: d });
+      hits++;
+    } else {
+      out.push(s.slice(pos, start + len));
+    }
+    pos = start + len;
+  }
+  if (!hits) return;
+  out.push(s.slice(pos));
+  var frag = document.createDocumentFragment();
+  out.forEach(function (o) {
+    if (typeof o === "string") { if (o) frag.appendChild(document.createTextNode(o)); return; }
+    var sp = document.createElement("span");
+    sp.className = "term"; sp.textContent = o.text;
+    sp.dataset.name = o.d.name; sp.dataset.def = o.d.def;
+    frag.appendChild(sp);
+  });
+  textNode.parentNode.replaceChild(frag, textNode);
+}
+function glossify(root) {
+  if (!root) return;
+  var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  var nodes = [];
+  while (walker.nextNode()) {
+    var p = walker.currentNode.parentNode;
+    if (p.closest && p.closest(".term,.gloss,.evkind,script,style")) continue;
+    nodes.push(walker.currentNode);
+  }
+  nodes.forEach(glossifyNode);
+}
+function placeTip(ev) {
+  var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+  var x = ev.clientX + 14, y = ev.clientY + 12;
+  if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
+  if (y + th > window.innerHeight - 8) y = ev.clientY - th - 12;
+  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
+}
+function showTermTip(ev, name, def) {
+  tooltip.textContent = "";
+  div("tt-t", tooltip, name);
+  div("tt-d", tooltip, def);
+  tooltip.style.display = "block";
+  placeTip(ev);
+}
+document.addEventListener("mouseover", function (ev) {
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
+});
+document.addEventListener("mouseout", function (ev) {
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = false; tooltip.style.display = "none"; }
+});
+document.addEventListener("click", function (ev) {  // touch: tap toggles
+  var t = ev.target.closest && ev.target.closest(".term");
+  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
+  else if (termActive) { termActive = false; tooltip.style.display = "none"; }
+});
+
+/* ---- findings: catalog signatures the server streams as they fire ---- */
+function drawFindings(notes) {
+  var card = $("findingscard"), host = $("findings");
+  if (!notes) return;
+  card.style.display = notes.length ? "" : "none";
+  host.textContent = "";
+  notes.forEach(function (n) {
+    var row = div("finding", host);
+    div("fsev", row).style.background = sevColor(n.sev);
+    div("ftext", row, n.text);
+    var span = n.t1 - n.t0;
+    div("fwhen", row, span > PERIOD * 0.05
+      ? "orbit " + (n.t0 / PERIOD).toFixed(2) + "–" + (n.t1 / PERIOD).toFixed(2)
+      : "orbit " + (n.t0 / PERIOD).toFixed(2));
+  });
+  glossify(host);
+}
+
+/* one-time: fill the glossary grid and glossify the primer */
+(function () {
+  var grid = $("gloss");
+  Object.keys(GLOSS).forEach(function (k) {
+    var b = document.createElement("b"); b.textContent = k;
+    var sp = document.createElement("span"); sp.textContent = GLOSS[k];
+    grid.appendChild(b); grid.appendChild(sp);
+  });
+  glossify(document.querySelector(".intro"));
+})();
 
 /* ---- theme ---- */
 (function () {
@@ -1089,6 +1307,7 @@ TILES.forEach(function (tl) {
   tl.vEl = div("vl", t, "—");
   tl.nEl = div("nt", t, "");
 });
+glossify($("tiles"));  // static labels only; values/notes reset by text
 function drawTiles() {
   TILES.forEach(function (tl) {
     var r = tl.make();
@@ -1103,6 +1322,7 @@ BOOT.pills.forEach(function (p) {
   p.el = div("pill", $("pills"), p.label);
   p.k = p.source + "/" + p.key;
 });
+glossify($("pills"));  // pill labels are static; only .on class toggles
 function drawPills() {
   BOOT.pills.forEach(function (p) {
     var v = lv(p.k);
@@ -1319,10 +1539,23 @@ function evPush(ev) {
               critical: "--critical" }[ev.sev] || "--muted";
   dot.style.background = "var(" + col + ")";
   line.appendChild(dot);
-  var b = document.createElement("b");
-  b.textContent = ev.source + " " + ev.kind;
   line.appendChild(document.createTextNode(
     "orbit " + (ev.t / PERIOD).toFixed(2) + " · "));
+  var b = document.createElement("b");
+  var sd = defFor(ev.source);
+  if (sd) {
+    var ss = document.createElement("span");
+    ss.className = "term"; ss.textContent = ev.source;
+    ss.dataset.name = sd.name; ss.dataset.def = sd.def;
+    b.appendChild(ss);
+  } else b.appendChild(document.createTextNode(ev.source));
+  b.appendChild(document.createTextNode(" "));
+  if (EVGLOSS[ev.kind]) {
+    var ks = document.createElement("span");
+    ks.className = "term"; ks.textContent = ev.kind;
+    ks.dataset.name = ev.kind; ks.dataset.def = EVGLOSS[ev.kind];
+    b.appendChild(ks);
+  } else b.appendChild(document.createTextNode(ev.kind));
   line.appendChild(b);
   if (ev.detail) line.appendChild(document.createTextNode(" " + ev.detail));
   var host = $("events");
@@ -1596,6 +1829,7 @@ function apply(f) {
     if (m.link) linkPush(m);
   });
   (f.events || []).forEach(evPush);
+  if (f.findings) drawFindings(f.findings);
   drawControls(); drawTiles(); drawPills(); drawLanes(); drawAllTable();
   if (reduced) { drawClock(); globe.render(displayTime()); }
 }

@@ -45,8 +45,12 @@ falls out.
   dependencies): an animated orbit view, stat tiles, a digital state
   strip (eclipse, contact, safe mode, shedding, ...), an event timeline
   with severity glyphs, and telemetry lanes with a shared crosshair,
-  eclipse shading, and table views. Its first render caught a wrong
-  mechanism claim in catalog entry 7.
+  eclipse shading, and table views. It teaches itself: every acronym
+  and term of art grows a hover definition, the event log explains each
+  event kind, and a **What happened** card runs the emergent-behavior
+  catalog's signatures against the flight and writes a plain-language
+  finding for each — click one to zoom every chart to its evidence. Its
+  first render caught a wrong mechanism claim in catalog entry 7.
 - **The space link is a real protocol** (`cubesat_sim.ccsds` +
   `cubesat_sim.linkdump`) — housekeeping telemetry crosses the channel
   as byte-true CCSDS-style TM transfer frames (sync marker, frame
@@ -75,9 +79,13 @@ falls out.
   queue a real TC through the ground station's ARQ, inject faults
   mid-flight, or publish raw bus messages — everything is recorded, so
   the flight stays replayable (though `(seed, dt)` alone no longer
-  reproduces a manually-commanded one). Because the server just tails
-  the flight recording over SSE, `--replay` re-flies any finished
-  recording the same way — view-only.
+  reproduces a manually-commanded one). It shares the flight report's
+  teaching layer — the same term tooltips, event definitions, and a
+  **What happened** card the server recomputes as the flight unfolds, so
+  a signature (an FDIR giveup, a shed one-way door) surfaces live the
+  moment it fires. Because the server just tails the flight recording
+  over SSE, `--replay` re-flies any finished recording the same way —
+  view-only.
 
 Rules of the house:
 

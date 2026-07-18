@@ -85,6 +85,47 @@ def test_glossary_covers_what_renders(tmp_path):
         assert s in gloss_lc, s
 
 
+def test_annotations_detect_the_confident_corpse():
+    """The entry-10 signature: FDIR gives up, and afterward the ADCS
+    believes it is calm (rate estimate below the mode gate) while the
+    truth tumbles past 2 deg/s. The detector must classify it as entry
+    10, not the generic giveup."""
+    from cubesat_sim.dashboard import _annotations
+    period = 5560.0
+    tg = 5.35 * period
+    # frozen estimate at 0.02 (with cross-language float wobble), truth
+    # spun up to ~7.8 by the undamped controller
+    est = [(tg + i, 0.0231 + (i % 3) * 1e-7) for i in range(0, 2000, 50)]
+    true = [(tg + i, 7.8 * i / 1950.0) for i in range(0, 2000, 50)]
+    evs = [(tg, "obc", "fdir_giveup", {"cycles_used": 3})]
+    notes = _annotations(evs, {}, {"rate_est": est, "rate_true": true},
+                         tg + 2000, period)
+    corpse = [n for n in notes if "entry 10" in n["text"]]
+    assert len(corpse) == 1
+    assert corpse[0]["sev"] == "critical"
+    assert abs(corpse[0]["t0"] - tg) < 1.0  # anchored at the giveup
+    assert corpse[0]["t1"] >= tg + 1900     # spans to (near) the end
+    assert "7.8 deg/s" in corpse[0]["text"]  # the pumped truth is reported
+
+
+def test_annotations_ground_veto_and_clean_flight():
+    """Entry 11 (the ground veto that starves the mission) fires when a
+    payload disable latches over unimaged target passes; a flight with
+    no signatures yields an empty list."""
+    from cubesat_sim.dashboard import _annotations
+    period = 5560.0
+    td = 4.25 * period
+    tracks = {"target visible": [[td + 500, td + 700], [td + period, td + period + 200]],
+              "imaging": []}
+    evs = [(td, "ground", "operator_disable_payload", {"reason": "power"})]
+    notes = _annotations(evs, tracks, {}, td + 3 * period, period)
+    veto = [n for n in notes if "entry 11" in n["text"]]
+    assert len(veto) == 1 and veto[0]["sev"] == "warning"
+    assert "2 target pass" in veto[0]["text"]
+
+    assert _annotations([], {}, {}, 10 * period, period) == []
+
+
 def test_downsampling_keeps_spikes():
     from cubesat_sim.dashboard import _downsample
     points = [(float(i), 0.0) for i in range(10000)]

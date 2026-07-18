@@ -12,9 +12,14 @@ tooltips wherever they appear (tiles, hints, legends, row labels), the
 event log defines every event kind on hover via EVENT_GLOSS, and the
 primer opens with the system in one minute. `_annotations` runs the
 emergent-behavior catalog's signatures against the flight and writes a
-plain-language "What happened" card, each finding click-to-zoom onto its
-evidence. The goal is that a reader can learn the whole spacecraft, and
-what this particular flight did, without leaving the page.
+plain-language "What happened" card: each finding is click-to-zoom onto
+its evidence and links to the catalog entry it matched (the real
+EMERGENT_BEHAVIORS.md text, embedded via `parse_catalog` so the report
+stays self-contained). A flight that goes off-nominal but matches no
+known signature is flagged "possibly new" — a prompt to investigate and,
+if real, catalog it. The goal is that a reader can learn the whole
+spacecraft, and what this particular flight did, without leaving the
+page.
 
 Usage:
     python -m cubesat_sim.dashboard runs/phase5_hard_failure.db
@@ -34,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +49,10 @@ from cubesat_sim.environment.orbit import R_EARTH, CircularOrbit
 from cubesat_sim.environment.sun import sun_direction_eci
 from cubesat_sim.faults import SAA_LAT_DEG, SAA_LON_DEG
 from cubesat_sim.physics.spacecraft import DEFAULT_STATION, DEFAULT_TARGETS
+
+# the emergent-behavior catalog, parsed at render time so findings can
+# link to the real entry text and the report stays self-contained
+_CATALOG_PATH = Path(__file__).resolve().parents[2] / "EMERGENT_BEHAVIORS.md"
 
 # analog lanes: (title, section, hint, unit, fixed y-domain or None, series)
 # each series: (source, key, label, transform)
@@ -539,7 +549,44 @@ def _annotations(evs, tracks_map, bag, t_end, period) -> list[dict]:
              f"flight software — JSON null / non-finite words rejected "
              f"before they could reach the bus (catalog entry 9).")
 
-    return sorted(notes, key=lambda n: n["t0"])
+    # tag every finding that names a catalog entry, so the report can link
+    # it and so "explained" below knows which distress the catalog covers
+    for n in notes:
+        m = re.search(r"entry (\d+)", n["text"])
+        if m:
+            n["entry"] = int(m.group(1))
+
+    # -- possibly new: distress the catalog didn't explain ----------------
+    # if the flight went off-nominal but no known signature fired, flag it
+    # loudly — the whole point of the simulator is to surface behaviors
+    # that aren't in EMERGENT_BEHAVIORS.md yet
+    true_tail = [v for t, v in bag.get("rate_true", []) if t > t_end - period]
+    shed_iv = tracks_map.get("load shed", [])
+    safe_iv = tracks_map.get("safe mode", [])
+    distress = []
+    if any(e[2] == "brownout" for e in evs):
+        distress.append("browned out")
+    if any(e[2] == "fdir_giveup" for e in evs):
+        distress.append("FDIR gave up")
+    if true_tail and true_tail[-1] > 2.0:
+        distress.append(f"ended tumbling at {true_tail[-1]:.1f} deg/s")
+    if (shed_iv and shed_iv[-1][1] >= t_end - 60.0
+            and shed_iv[-1][1] - shed_iv[-1][0] > period):
+        distress.append("load-shed latched to the end")
+    if (safe_iv and safe_iv[-1][1] >= t_end - 60.0
+            and safe_iv[-1][1] - safe_iv[-1][0] > period):
+        distress.append("stuck in safe mode")
+    explained = any("entry" in n for n in notes)
+    if distress and not explained:
+        notes.append({
+            "sev": "critical", "new": True,
+            "t0": _round(0.0), "t1": _round(t_end),
+            "text": "This flight went off-nominal (" + "; ".join(distress) +
+            ") but matched no catalogued mechanism — possibly a new "
+            "emergent behavior. Worth digging into and, if it's real, "
+            "adding to EMERGENT_BEHAVIORS.md as a new entry."})
+
+    return sorted(notes, key=lambda n: (0 if n.get("new") else 1, n["t0"]))
 
 
 def _fmt_detail(detail: dict) -> str:
@@ -550,6 +597,42 @@ def _fmt_detail(detail: dict) -> str:
         else:
             parts.append(f"{k}={v}")
     return ", ".join(parts)
+
+
+_CATALOG_CACHE: dict[str, dict] | None = None
+
+
+def parse_catalog(path: Path = _CATALOG_PATH) -> dict[str, dict]:
+    """Parse EMERGENT_BEHAVIORS.md into {entry_number: {title, mechanism,
+    status}} so findings can carry the real catalog text (kept embedded —
+    the report must stay self-contained). Cached; missing file yields an
+    empty catalog and findings simply render without the expandable
+    entry."""
+    global _CATALOG_CACHE
+    if _CATALOG_CACHE is not None:
+        return _CATALOG_CACHE
+    catalog: dict[str, dict] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        _CATALOG_CACHE = catalog
+        return catalog
+    # entries are "## N. Title", each with "- mechanism:" and "- status:"
+    # bullets whose values can wrap across lines until the next bullet
+    for block in re.split(r"\n(?=## \d+\.)", text):
+        m = re.match(r"## (\d+)\.\s*(.+)", block)
+        if not m:
+            continue
+        num, title = m.group(1), m.group(2).strip()
+
+        def field(name: str) -> str:
+            fm = re.search(rf"- {name}:\s*(.+?)(?=\n- |\n## |\Z)", block, re.S)
+            return re.sub(r"\s+", " ", fm.group(1)).strip() if fm else ""
+
+        catalog[num] = {"title": title, "mechanism": field("mechanism"),
+                        "status": field("status")}
+    _CATALOG_CACHE = catalog
+    return catalog
 
 
 def compute_annotations(db: sqlite3.Connection, t_end: float,
@@ -677,6 +760,7 @@ def load_flight(db_path: str | Path) -> dict:
             "events": events,
             "lanes": lanes,
             "annotations": annotations,
+            "catalog": parse_catalog(),
             "orbit3d": _orbit_geometry(epoch_iso),
             "gloss": GLOSSARY,
             "evgloss": EVENT_GLOSS,
@@ -876,14 +960,30 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
            cursor: pointer; }
 .finding:first-child { border-top: none; }
 .finding:hover { background: var(--band); }
+.finding.isnew { background: var(--bandc);
+                 border-left: 3px solid var(--critical); padding-left: 8px; }
 .finding .fsev { flex: none; width: 9px; height: 9px; border-radius: 50%;
                  margin-top: 5px; }
-.finding .ftext { flex: 1; color: var(--ink-2); }
+.finding .fmain { flex: 1; min-width: 0; }
+.finding .ftext { color: var(--ink-2); }
 .finding .fwhen { flex: none; color: var(--muted); font-size: 11.5px;
                   font-variant-numeric: tabular-nums; white-space: nowrap;
                   margin-top: 1px; }
 .finding .zoomto { color: var(--s1); font-size: 11.5px; white-space: nowrap; }
 .findings-none { color: var(--muted); font-size: 12.5px; padding: 2px; }
+.newbadge { display: inline-block; font-size: 10.5px; font-weight: 700;
+            letter-spacing: 0.05em; text-transform: uppercase;
+            color: var(--surface); background: var(--critical);
+            border-radius: 5px; padding: 1px 6px; margin-right: 6px;
+            vertical-align: 1px; }
+.catchip { display: inline-block; margin-top: 5px; font-size: 11.5px;
+           color: var(--s1); cursor: pointer; user-select: none; }
+.catchip:hover { text-decoration: underline; }
+.catpanel { margin: 6px 0 2px; padding: 8px 10px; border-left: 2px solid
+            var(--border); background: var(--band); border-radius: 0 6px 6px 0;
+            font-size: 12px; color: var(--ink-2); }
+.catpanel .catmech { margin-bottom: 6px; }
+.catpanel .catstatus { color: var(--muted); font-size: 11.5px; }
 /* event-log severity filter chips */
 .evchips { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .evchip { font-size: 11.5px; color: var(--muted); border: 1px solid
@@ -1108,7 +1208,7 @@ function glossify(root) {
   var nodes = [];
   while (walker.nextNode()) {
     var p = walker.currentNode.parentNode;
-    if (p.closest && p.closest(".term,.gloss,.evkind,script,style")) continue;
+    if (p.closest && p.closest(".term,.gloss,.evkind,.catchip,script,style")) continue;
     nodes.push(walker.currentNode);
   }
   nodes.forEach(glossifyNode);
@@ -1807,12 +1907,38 @@ function drawFindings() {
       .querySelector(".zinfo").textContent = "auto-detected from the flight";
     return;
   }
+  var CAT = DATA.catalog || {};
   notes.forEach(function (n) {
-    var row = div("finding", host);
+    var row = div("finding" + (n.new ? " isnew" : ""), host);
     var dot = div("fsev", row);
     dot.style.background = SEV[n.sev] || SEV.neutral;
-    var body = div("ftext", row);
-    body.textContent = n.text;
+    var main = div("fmain", row);
+    var body = div("ftext", main);
+    if (n.new) {
+      var badge = document.createElement("span");
+      badge.className = "newbadge"; badge.textContent = "possibly new";
+      body.appendChild(badge);
+    }
+    body.appendChild(document.createTextNode(n.text));
+    // link to the catalog entry this finding matched — the real entry
+    // text, embedded, expands inline (keeps the report self-contained)
+    var cat = n.entry && CAT[n.entry];
+    if (cat) {
+      var label = "catalog entry " + n.entry + ": " + cat.title;
+      var chip = div("catchip nogloss", main);
+      chip.textContent = "▸ " + label;
+      var panel = div("catpanel", main);
+      panel.style.display = "none";
+      div("catmech", panel).textContent = cat.mechanism;
+      if (cat.status) div("catstatus", panel).textContent = "status: " + cat.status;
+      chip.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var open = panel.style.display === "none";
+        panel.style.display = open ? "" : "none";
+        chip.textContent = (open ? "▾ " : "▸ ") + label;
+      });
+      panel.addEventListener("click", function (ev) { ev.stopPropagation(); });
+    }
     var when = div("fwhen", row);
     var span = n.t1 - n.t0;
     when.textContent = span > PERIOD * 0.05

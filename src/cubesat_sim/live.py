@@ -35,7 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cubesat_sim.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
-    GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations
+    GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations, \
+    parse_catalog
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.linkdump import describe_link_message
 from cubesat_sim.mission import build_sim
@@ -163,7 +164,7 @@ def _boot_common(title: str, mode: str, meta: dict) -> dict:
         "lanes": _lane_specs(),
         "pills": [{"source": s, "key": k, "label": lb}
                   for s, k, lb in DIGITAL_TRACKS],
-        "gloss": GLOSSARY, "evgloss": EVENT_GLOSS,
+        "gloss": GLOSSARY, "evgloss": EVENT_GLOSS, "catalog": parse_catalog(),
     }
 
 
@@ -748,12 +749,28 @@ summary { cursor: pointer; font-size: 12.5px; }
 .finding { display: flex; gap: 10px; align-items: flex-start;
            padding: 8px 4px; border-top: 1px solid var(--grid); }
 .finding:first-child { border-top: none; }
+.finding.isnew { background: var(--bandc);
+                 border-left: 3px solid var(--critical); padding-left: 6px; }
 .finding .fsev { flex: none; width: 9px; height: 9px; border-radius: 50%;
                  margin-top: 5px; }
-.finding .ftext { flex: 1; color: var(--ink-2); }
+.finding .fmain { flex: 1; min-width: 0; }
+.finding .ftext { color: var(--ink-2); }
 .finding .fwhen { flex: none; color: var(--muted); font-size: 11.5px;
                   font-variant-numeric: tabular-nums; white-space: nowrap;
                   margin-top: 1px; }
+.newbadge { display: inline-block; font-size: 10.5px; font-weight: 700;
+            letter-spacing: 0.05em; text-transform: uppercase;
+            color: var(--surface); background: var(--critical);
+            border-radius: 5px; padding: 1px 6px; margin-right: 6px;
+            vertical-align: 1px; }
+.catchip { display: inline-block; margin-top: 5px; font-size: 11.5px;
+           color: var(--s1); cursor: pointer; user-select: none; }
+.catchip:hover { text-decoration: underline; }
+.catpanel { margin: 6px 0 2px; padding: 8px 10px; border-left: 2px solid
+            var(--border); background: var(--band); border-radius: 0 6px 6px 0;
+            font-size: 12px; color: var(--ink-2); }
+.catpanel .catmech { margin-bottom: 6px; }
+.catpanel .catstatus { color: var(--muted); font-size: 11.5px; }
 </style>
 </head>
 <body>
@@ -987,7 +1004,7 @@ function glossify(root) {
   var nodes = [];
   while (walker.nextNode()) {
     var p = walker.currentNode.parentNode;
-    if (p.closest && p.closest(".term,.gloss,.evkind,script,style")) continue;
+    if (p.closest && p.closest(".term,.gloss,.evkind,.catchip,script,style")) continue;
     nodes.push(walker.currentNode);
   }
   nodes.forEach(glossifyNode);
@@ -1021,15 +1038,39 @@ document.addEventListener("click", function (ev) {  // touch: tap toggles
 });
 
 /* ---- findings: catalog signatures the server streams as they fire ---- */
+var CAT = BOOT.catalog || {};
 function drawFindings(notes) {
   var card = $("findingscard"), host = $("findings");
   if (!notes) return;
   card.style.display = notes.length ? "" : "none";
   host.textContent = "";
   notes.forEach(function (n) {
-    var row = div("finding", host);
-    div("fsev", row).style.background = sevColor(n.sev);
-    div("ftext", row, n.text);
+    var row = div("finding" + (n.new ? " isnew" : ""), host);
+    div("fsev", row).style.background = n.new ? sevColor("critical")
+                                              : sevColor(n.sev);
+    var main = div("fmain", row);
+    var body = div("ftext", main);
+    if (n.new) {
+      var badge = document.createElement("span");
+      badge.className = "newbadge"; badge.textContent = "possibly new";
+      body.appendChild(badge);
+    }
+    body.appendChild(document.createTextNode(n.text));
+    var cat = n.entry && CAT[n.entry];
+    if (cat) {
+      var label = "catalog entry " + n.entry + ": " + cat.title;
+      var chip = div("catchip nogloss", main);
+      chip.textContent = "▸ " + label;
+      var panel = div("catpanel", main);
+      panel.style.display = "none";
+      div("catmech", panel, cat.mechanism);
+      if (cat.status) div("catstatus", panel, "status: " + cat.status);
+      chip.addEventListener("click", function () {
+        var open = panel.style.display === "none";
+        panel.style.display = open ? "" : "none";
+        chip.textContent = (open ? "▾ " : "▸ ") + label;
+      });
+    }
     var span = n.t1 - n.t0;
     div("fwhen", row, span > PERIOD * 0.05
       ? "orbit " + (n.t0 / PERIOD).toFixed(2) + "–" + (n.t1 / PERIOD).toFixed(2)

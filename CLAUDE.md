@@ -91,7 +91,14 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
   once, the live console re-runs it every ~3 s as the flight grows
   (findings can refine/withdraw — honest for a live feed). Detectors
   live in `_annotations`; each maps to a numbered EMERGENT_BEHAVIORS.md
-  entry and must stay cheap to verify by eye in the charts.
+  entry (tagged by a regex over the finding text) and must stay cheap to
+  verify by eye in the charts. `parse_catalog` embeds the real entry
+  text in the payload so a finding links to it self-contained. A flight
+  with distress signals but no entry-tagged finding gets a `new: True`
+  "possibly new" flag — so when you add a detector for a behavior, also
+  add its entry to EMERGENT_BEHAVIORS.md or the flag keeps firing. Keep
+  detectors conservative: on the 24-seed campaign only seed 9 flags, and
+  it's a genuine boundary case (degraded array parks in SAFE, no shed).
 - The live console's command panel (live flights only) posts
   `tc`/`inject` actions to `POST /control`; injections are queued and
   applied on the runner thread between ticks, and ground TCs ride

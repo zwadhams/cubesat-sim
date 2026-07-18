@@ -103,9 +103,50 @@ def test_annotations_detect_the_confident_corpse():
     corpse = [n for n in notes if "entry 10" in n["text"]]
     assert len(corpse) == 1
     assert corpse[0]["sev"] == "critical"
+    assert corpse[0]["entry"] == 10          # tagged for the catalog link
     assert abs(corpse[0]["t0"] - tg) < 1.0  # anchored at the giveup
     assert corpse[0]["t1"] >= tg + 1900     # spans to (near) the end
     assert "7.8 deg/s" in corpse[0]["text"]  # the pumped truth is reported
+    # the catalog explains this flight, so it is NOT flagged as new
+    assert not any(n.get("new") for n in notes)
+
+
+def test_annotations_flag_uncatalogued_distress():
+    """A flight that goes off-nominal but matches no catalogued mechanism
+    is flagged 'possibly new' and sorted to the top; one the catalog
+    explains is not."""
+    from cubesat_sim.dashboard import _annotations
+    period = 5560.0
+    # a brownout with nothing the detectors recognize -> possibly new
+    notes = _annotations([(3.0 * period, "physics", "brownout", {})],
+                         {}, {}, 5 * period, period)
+    new = [n for n in notes if n.get("new")]
+    assert len(new) == 1
+    assert new[0] is notes[0]                  # surfaced at the top
+    assert "browned out" in new[0]["text"]
+    assert "EMERGENT_BEHAVIORS" in new[0]["text"]
+
+    # the same brownout, now explained by the entry-6 one-way door
+    # (shed latched to the end while the panel faces anti-sun): not new
+    shed = {"load shed": [[3.0 * period, 5 * period]]}
+    facing = {"sun_facing": [(3.2 * period + i, -0.5) for i in range(0, 5000, 500)]}
+    notes2 = _annotations([(3.0 * period, "physics", "brownout", {})],
+                          shed, facing, 5 * period, period)
+    assert any(n.get("entry") == 6 for n in notes2)
+    assert not any(n.get("new") for n in notes2)
+
+
+def test_parse_catalog_reads_the_markdown():
+    """The findings' catalog links carry the real EMERGENT_BEHAVIORS.md
+    text, embedded so the report stays self-contained."""
+    from cubesat_sim.dashboard import parse_catalog
+    cat = parse_catalog()
+    assert "10" in cat and "6" in cat
+    assert "confident corpse" in cat["10"]["title"]
+    assert cat["10"]["mechanism"] and cat["10"]["status"]
+    # every entry a detector can emit must resolve to real catalog text
+    for entry in ("1", "3", "6", "7", "8", "9", "10", "11", "12"):
+        assert cat.get(entry, {}).get("title"), entry
 
 
 def test_annotations_ground_veto_and_clean_flight():

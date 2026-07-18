@@ -49,8 +49,12 @@ falls out.
   and term of art grows a hover definition, the event log explains each
   event kind, and a **What happened** card runs the emergent-behavior
   catalog's signatures against the flight and writes a plain-language
-  finding for each — click one to zoom every chart to its evidence. Its
-  first render caught a wrong mechanism claim in catalog entry 7.
+  finding for each — click one to zoom every chart to its evidence, or
+  expand the catalog entry it matched (the real EMERGENT_BEHAVIORS.md
+  text, embedded). A flight that goes off-nominal but matches no known
+  signature is flagged **possibly new** — a prompt to investigate a
+  behavior the catalog hasn't seen yet. Its first render caught a wrong
+  mechanism claim in catalog entry 7.
 - **The space link is a real protocol** (`cubesat_sim.ccsds` +
   `cubesat_sim.linkdump`) — housekeeping telemetry crosses the channel
   as byte-true CCSDS-style TM transfer frames (sync marker, frame

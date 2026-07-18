@@ -879,13 +879,26 @@ header button {
 .card { background: var(--surface); border: 1px solid var(--border);
         border-radius: 10px; padding: 12px 14px 10px; margin-bottom: 12px; }
 .card h2 { font-size: 13px; font-weight: 650; margin: 0 0 8px; color: var(--ink); }
-.card-head { display: flex; align-items: baseline; gap: 10px; }
+.card-head { display: flex; align-items: baseline; gap: 10px;
+             flex-wrap: wrap; }
 .card-head h2 { margin-bottom: 8px; }
 .card-head .zinfo { font-size: 11.5px; color: var(--muted); }
 .card-head button { margin-left: auto; font: inherit; font-size: 11.5px;
   color: var(--ink-2); background: var(--surface);
   border: 1px solid var(--border); border-radius: 7px; padding: 1px 9px;
   cursor: pointer; }
+/* telemetry window readout: prominent, always on */
+#zinfo { font-size: 12px; color: var(--ink-2);
+         font-variant-numeric: tabular-nums; }
+/* zoom / pan control bar */
+.zoomctl { margin-left: auto; display: inline-flex; gap: 4px;
+           align-self: center; }
+.zoomctl button { margin-left: 0; font-size: 12px; min-width: 27px;
+                  text-align: center; padding: 2px 8px; }
+.zoomctl button:hover { border-color: var(--s1); color: var(--ink); }
+.zoomctl button:disabled { opacity: 0.4; cursor: default;
+                           border-color: var(--border); color: var(--ink-2); }
+svg text.axsub { font-size: 9.5px; fill: var(--muted); }
 .intro { background: var(--surface); border: 1px solid var(--border);
          border-radius: 10px; padding: 4px 14px; margin: 0 0 12px;
          color: var(--ink-2); font-size: 13px; }
@@ -1032,9 +1045,12 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
       <li><strong>Hover anywhere</strong> for a crosshair across every
         chart with exact values. If the orbit replay is paused, the
         satellite follows your crosshair.</li>
-      <li><strong>Drag horizontally</strong> on any chart to zoom every
-        chart to that window; <strong>double-click</strong> (or the
-        reset button) to zoom back out.</li>
+      <li><strong>Zoom &amp; pan:</strong> drag horizontally on any chart
+        to zoom every chart to that window, or use the
+        <strong>&minus; + &#9664; &#9654; reset</strong> controls by the
+        telemetry heading; <strong>double-click</strong> a chart to zoom
+        back out. The readout and the x-axis show the window in both
+        orbits and elapsed mission time (h:mm:ss).</li>
       <li>Event glyphs: <strong>▲ critical</strong>, <strong>◆
         warning</strong>, <strong>● recovery/good</strong>, ○ neutral.
         The full list with details is in the event log below.</li>
@@ -1059,7 +1075,13 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
     <div id="events"></div></div>
   <div class="card">
     <div class="card-head"><h2>Telemetry</h2><span class="zinfo" id="zinfo"></span>
-      <button id="zoomreset" type="button" hidden>reset zoom</button></div>
+      <span class="zoomctl" id="zoomctl">
+        <button data-z="out" type="button" title="zoom out">&minus;</button>
+        <button data-z="in" type="button" title="zoom in">+</button>
+        <button data-z="panL" type="button" title="pan earlier">&#9664;</button>
+        <button data-z="panR" type="button" title="pan later">&#9654;</button>
+        <button id="zoomreset" type="button" title="reset to full flight">reset</button>
+      </span></div>
     <div id="lanes"></div><div id="xaxis"></div></div>
   <div class="card">
     <div class="card-head"><h2>Event log</h2>
@@ -1103,6 +1125,18 @@ function fmt(v) {
   return v.toPrecision(2);
 }
 function orbits(t) { return t / PERIOD; }
+function pad(n) { return (n < 10 ? "0" : "") + n; }
+/* elapsed mission time: H:MM:SS, dropping the hours field under an hour */
+function hms(t) {
+  var s = Math.round(t), h = Math.floor(s / 3600),
+      m = Math.floor(s / 60) % 60, ss = s % 60;
+  return (h ? h + ":" + pad(m) : m) + ":" + pad(ss);
+}
+/* coarser H:MM for the window readout */
+function hm(t) {
+  var s = Math.round(t);
+  return Math.floor(s / 3600) + ":" + pad(Math.floor(s / 60) % 60);
+}
 function niceStep(span, n) {
   var raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
   var r = raw / mag;
@@ -1451,21 +1485,30 @@ function nearest(points, t) {
 function drawXAxis(hostId) {
   var host = document.getElementById(hostId);
   host.textContent = "";
-  var W = laneWidth(), H = 24, plotW = W - PADL - PADR;
+  var W = laneWidth(), H = 33, plotW = W - PADL - PADR;
   var svg = el("svg", { width: W, height: H }, host);
   var step = orbitStep();
   var decimals = step >= 1 ? 0 : step >= 0.5 ? 1 : 2;
   var o0 = Math.ceil(VIEW.t0 / PERIOD / step) * step;
+  var lastSub = -1e9;  // elapsed labels are wider — thin them when crowded
   for (var o = o0; o * PERIOD <= VIEW.t1 + 1e-9; o += step) {
     var x = xOf(o * PERIOD, plotW);
     if (x > PADL + plotW + 1) break;
     el("line", { x1: x, y1: 0, x2: x, y2: 5, stroke: "var(--axis)",
                  "stroke-width": 1 }, svg);
-    var t = el("text", { x: x, y: 17, "text-anchor": "middle" }, svg);
+    var t = el("text", { x: x, y: 16, "text-anchor": "middle" }, svg);
     t.textContent = o.toFixed(decimals);
+    if (x - lastSub >= 46) {
+      var sub = el("text", { x: x, y: 29, "text-anchor": "middle",
+                             "class": "axsub" }, svg);
+      sub.textContent = hms(o * PERIOD);
+      lastSub = x;
+    }
   }
-  var lbl = el("text", { x: PADL + plotW, y: 17, "text-anchor": "end" }, svg);
-  lbl.textContent = "orbits";
+  el("text", { x: PADL + plotW, y: 16, "text-anchor": "end" }, svg)
+    .textContent = "orbits";
+  el("text", { x: PADL + plotW, y: 29, "text-anchor": "end", "class": "axsub" },
+     svg).textContent = "elapsed";
 }
 
 /* ---- orbit view: canvas globe + animated satellite ---- */
@@ -2023,11 +2066,15 @@ themebtn.addEventListener("click", function () {
 var lastBuildWidth = 0;
 function updateZoomUI() {
   var zoomed = VIEW.t0 > 0 || VIEW.t1 < T_END;
-  document.getElementById("zoomreset").hidden = !zoomed;
-  document.getElementById("zinfo").textContent = zoomed
-    ? ("orbit " + orbits(VIEW.t0).toFixed(2) + " – "
-       + orbits(VIEW.t1).toFixed(2) + " of " + orbits(T_END).toFixed(1))
-    : "drag on a chart to zoom";
+  document.getElementById("zoomreset").disabled = !zoomed;
+  var span = VIEW.t1 - VIEW.t0;
+  var spanTxt = span < 5400 ? Math.round(span / 60) + " min"
+                            : (span / 3600).toFixed(1) + " h";
+  var txt = "orbit " + orbits(VIEW.t0).toFixed(2) + "–"
+          + orbits(VIEW.t1).toFixed(2) + " · elapsed "
+          + hm(VIEW.t0) + "–" + hm(VIEW.t1) + " · " + spanTxt;
+  document.getElementById("zinfo").textContent =
+    txt + (zoomed ? "" : " · full flight");
 }
 function buildAll() {
   charts = [];
@@ -2085,6 +2132,23 @@ function buildAll() {
   });
 })();
 document.getElementById("zoomreset").addEventListener("click", resetView);
+/* zoom / pan buttons: zoom about the window center, pan by 30% of span.
+   setView clamps to [0, T_END] and rebuilds every chart. */
+function panBy(frac) {
+  var span = VIEW.t1 - VIEW.t0, d = span * frac;
+  if (VIEW.t0 + d < 0) d = -VIEW.t0;
+  if (VIEW.t1 + d > T_END) d = T_END - VIEW.t1;
+  if (d !== 0) setView(VIEW.t0 + d, VIEW.t1 + d);
+}
+document.getElementById("zoomctl").addEventListener("click", function (ev) {
+  var z = ev.target.getAttribute("data-z");
+  if (!z) return;  // the reset button (no data-z) has its own handler
+  var c = (VIEW.t0 + VIEW.t1) / 2, span = VIEW.t1 - VIEW.t0;
+  if (z === "in") setView(c - span / 4, c + span / 4);
+  else if (z === "out") setView(c - span, c + span);
+  else if (z === "panL") panBy(-0.3);
+  else if (z === "panR") panBy(0.3);
+});
 var resizeTimer = null;
 window.addEventListener("resize", function () {
   clearTimeout(resizeTimer);

@@ -18,8 +18,8 @@ Because the server only ever tails a recording, `--replay` can "fly" any
 finished flight (a Monte Carlo campaign recording, say) at any speed.
 
 Usage:
-    python -m cubesat_sim.live --seed 19 --orbits 4 --seu-rate 6 --speed 60
-    python -m cubesat_sim.live --replay runs/campaign1/flight_0019.db
+    python -m cubesat_sim.frontend.live --seed 19 --orbits 4 --seu-rate 6 --speed 60
+    python -m cubesat_sim.frontend.live --replay runs/campaign1/flight_0019.db
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cubesat_sim.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
+from cubesat_sim.frontend.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
     GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations, \
     parse_catalog
 from cubesat_sim.environment.orbit import CircularOrbit

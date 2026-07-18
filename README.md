@@ -40,7 +40,7 @@ falls out.
   parallel campaigns with seed-deterministic random misfortunes, keeps
   every flight recording for replay, and classifies outcomes
   (NOMINAL/SAFE/SHED/FDIR_GIVEUP/BROWNED_OUT/DEAD/CRASHED).
-- **Flight reports** (`cubesat_sim.dashboard`) — renders any flight
+- **Flight reports** (`cubesat_sim.frontend.dashboard`) — renders any flight
   recording into a single self-contained HTML file (no server, no
   dependencies): an animated orbit view, stat tiles, a digital state
   strip (eclipse, contact, safe mode, shedding, ...), an event timeline
@@ -73,7 +73,7 @@ falls out.
   power-protection veto beside the storage rule.
   `python -m cubesat_sim.linkdump <recording.db>` plays protocol
   analyzer over any flight.
-- **Live mission console** (`cubesat_sim.live`) — flies a mission paced
+- **Live mission console** (`cubesat_sim.frontend.live`) — flies a mission paced
   to wall clock and serves an ops-room page in the browser: mission
   clock, the orbit globe with the sat moving in real time, live stat
   tiles and rolling telemetry lanes, a spacecraft-bus monitor (every
@@ -147,8 +147,8 @@ Prefer the standard library? `python3 -m venv .venv && .venv/bin/pip install
 of the OBC and EPS):
 
 ```bash
-make -C c/obc && make -C c/eps && make -C cpp/comms
-cargo build --release --manifest-path rust/adcs/Cargo.toml
+make -C backend/obc-c && make -C backend/eps-c && make -C backend/comms-cpp
+cargo build --release --manifest-path backend/adcs-rust/Cargo.toml
 ```
 
 **3. Run the tests, fly a demo, and open the report:**
@@ -156,7 +156,7 @@ cargo build --release --manifest-path rust/adcs/Cargo.toml
 ```bash
 .venv/bin/pytest                                      # ~4 min, all green
 .venv/bin/python examples/phase6_link_demo.py         # -> runs/phase6_link.db
-.venv/bin/python -m cubesat_sim.dashboard runs/phase6_link.db  # -> runs/phase6_link.html
+.venv/bin/python -m cubesat_sim.frontend.dashboard runs/phase6_link.db  # -> runs/phase6_link.html
 ```
 
 Open `runs/phase6_link.html` in any browser — a self-contained flight
@@ -168,7 +168,7 @@ Decode the space link with
 **4. Fly one live** and watch it in the browser at http://localhost:8765:
 
 ```bash
-.venv/bin/python -m cubesat_sim.live --seed 19 --orbits 4 --seu-rate 6 \
+.venv/bin/python -m cubesat_sim.frontend.live --seed 19 --orbits 4 --seu-rate 6 \
     --campaign --speed 60
 ```
 

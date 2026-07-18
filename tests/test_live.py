@@ -18,7 +18,7 @@ from cubesat_sim import Simulation, ccsds
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.faults import sensor_stuck
 from cubesat_sim.ground.station import GroundStation
-from cubesat_sim.live import Console
+from cubesat_sim.frontend.live import Console
 from cubesat_sim.mission import build_sim
 
 LIGHT = dict(obc_impl="python", eps_impl="python",

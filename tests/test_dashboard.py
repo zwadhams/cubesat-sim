@@ -3,7 +3,7 @@
 import json
 import re
 
-from cubesat_sim.dashboard import load_flight, render_flight
+from cubesat_sim.frontend.dashboard import load_flight, render_flight
 from cubesat_sim.faults import sensor_stuck
 from cubesat_sim.mission import build_sim
 
@@ -70,7 +70,7 @@ def test_glossary_covers_what_renders(tmp_path):
     """The teaching layer must not have holes: every event kind, state
     channel, and event source that can appear in a report has a
     plain-language definition riding along in the payload."""
-    from cubesat_sim.dashboard import EVENT_GLOSS, EVENT_SEVERITY
+    from cubesat_sim.frontend.dashboard import EVENT_GLOSS, EVENT_SEVERITY
     # every severity-classified kind is explained
     assert set(EVENT_SEVERITY) <= set(EVENT_GLOSS)
 
@@ -90,7 +90,7 @@ def test_annotations_detect_the_confident_corpse():
     believes it is calm (rate estimate below the mode gate) while the
     truth tumbles past 2 deg/s. The detector must classify it as entry
     10, not the generic giveup."""
-    from cubesat_sim.dashboard import _annotations
+    from cubesat_sim.frontend.dashboard import _annotations
     period = 5560.0
     tg = 5.35 * period
     # frozen estimate at 0.02 (with cross-language float wobble), truth
@@ -115,7 +115,7 @@ def test_annotations_flag_uncatalogued_distress():
     """A flight that goes off-nominal but matches no catalogued mechanism
     is flagged 'possibly new' and sorted to the top; one the catalog
     explains is not."""
-    from cubesat_sim.dashboard import _annotations
+    from cubesat_sim.frontend.dashboard import _annotations
     period = 5560.0
     # a brownout with nothing the detectors recognize -> possibly new
     notes = _annotations([(3.0 * period, "physics", "brownout", {})],
@@ -139,7 +139,7 @@ def test_annotations_flag_uncatalogued_distress():
 def test_parse_catalog_reads_the_markdown():
     """The findings' catalog links carry the real EMERGENT_BEHAVIORS.md
     text, embedded so the report stays self-contained."""
-    from cubesat_sim.dashboard import parse_catalog
+    from cubesat_sim.frontend.dashboard import parse_catalog
     cat = parse_catalog()
     assert "10" in cat and "6" in cat
     assert "confident corpse" in cat["10"]["title"]
@@ -153,7 +153,7 @@ def test_annotations_ground_veto_and_clean_flight():
     """Entry 11 (the ground veto that starves the mission) fires when a
     payload disable latches over unimaged target passes; a flight with
     no signatures yields an empty list."""
-    from cubesat_sim.dashboard import _annotations
+    from cubesat_sim.frontend.dashboard import _annotations
     period = 5560.0
     td = 4.25 * period
     tracks = {"target visible": [[td + 500, td + 700], [td + period, td + period + 200]],
@@ -168,7 +168,7 @@ def test_annotations_ground_veto_and_clean_flight():
 
 
 def test_downsampling_keeps_spikes():
-    from cubesat_sim.dashboard import _downsample
+    from cubesat_sim.frontend.dashboard import _downsample
     points = [(float(i), 0.0) for i in range(10000)]
     points[7777] = (7777.0, 99.0)  # one SEU-like spike
     out = _downsample(points, max_buckets=300)

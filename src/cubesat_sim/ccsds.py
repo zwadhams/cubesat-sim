@@ -1,7 +1,7 @@
 """CCSDS-flavored space data link: frames, packets, CRC.
 
 This is the ground-segment (and test-bench) implementation of the link
-protocol; the flight side lives independently in cpp/comms/main.cpp, the
+protocol; the flight side lives independently in backend/comms-cpp/main.cpp, the
 way a real program has two implementations that must interoperate. The
 formats are simplified but structurally honest CCSDS:
 

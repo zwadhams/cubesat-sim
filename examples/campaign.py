@@ -5,7 +5,7 @@ single arm, random fault campaigns + SEU weather, full recordings — every
 flight opens directly in the dashboard:
 
     python examples/campaign.py
-    python -m cubesat_sim.dashboard runs/campaign1/flight_0007.db
+    python -m cubesat_sim.frontend.dashboard runs/campaign1/flight_0007.db
 """
 
 import argparse

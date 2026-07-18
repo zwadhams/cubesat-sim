@@ -61,7 +61,7 @@ Template:
 
 ## 4. Startup-race tumble pumping (fixed — broke sim integrity)
 - first observed: Phase 3 development
-- reproduce: revert the `has_gyro` guard in `rust/adcs/src/main.rs`,
+- reproduce: revert the `has_gyro` guard in `backend/adcs-rust/src/main.rs`,
   `build_sim(dt=1.0, seed=21)`, ~1 orbit
 - mechanism: on its first control frame the ADCS had received no sensor
   data yet, read a zeroed gyro as "rate below detumble-exit threshold," and
@@ -81,7 +81,7 @@ Template:
 ## 5. Under-sampled control loop divergence + NaN bus deadlock (fixed —
 ##    broke sim integrity)
 - first observed: Phase 3 development
-- reproduce: revert the gain-scheduling block in `rust/adcs/src/main.rs`,
+- reproduce: revert the gain-scheduling block in `backend/adcs-rust/src/main.rs`,
   `build_sim(dt=5.0, seed=1)`, ~350 ticks
 - mechanism: two-stage failure. (1) The sun-point PD gains were designed
   for a 1 Hz control rate; run at 0.2 Hz (sim dt=5) the damping term alone

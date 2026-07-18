@@ -22,8 +22,8 @@ spacecraft, and what this particular flight did, without leaving the
 page.
 
 Usage:
-    python -m cubesat_sim.dashboard runs/phase5_hard_failure.db
-    python -m cubesat_sim.dashboard runs/mc/*.db        # one report each
+    python -m cubesat_sim.frontend.dashboard runs/phase5_hard_failure.db
+    python -m cubesat_sim.frontend.dashboard runs/mc/*.db        # one report each
 
 or programmatically: `render_flight("runs/foo.db")` -> Path to the HTML.
 
@@ -52,7 +52,7 @@ from cubesat_sim.physics.spacecraft import DEFAULT_STATION, DEFAULT_TARGETS
 
 # the emergent-behavior catalog, parsed at render time so findings can
 # link to the real entry text and the report stays self-contained
-_CATALOG_PATH = Path(__file__).resolve().parents[2] / "EMERGENT_BEHAVIORS.md"
+_CATALOG_PATH = Path(__file__).resolve().parents[3] / "EMERGENT_BEHAVIORS.md"
 
 # analog lanes: (title, section, hint, unit, fixed y-domain or None, series)
 # each series: (source, key, label, transform)

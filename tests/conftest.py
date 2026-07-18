@@ -46,6 +46,6 @@ def rust_adcs_binary():
     if not Path(cargo).exists():
         pytest.skip("no Rust toolchain available")
     subprocess.run([cargo, "build", "--release"],
-                   cwd=REPO_ROOT / "rust" / "adcs",
+                   cwd=REPO_ROOT / "backend" / "adcs-rust",
                    check=True, capture_output=True)
     return RUST_ADCS_BIN

@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 runs/
 *.db
-c/obc/obc
-cpp/comms/comms
-rust/adcs/target/
-c/eps/eps
+backend/obc-c/obc
+backend/comms-cpp/comms
+backend/adcs-rust/target/
+backend/eps-c/eps

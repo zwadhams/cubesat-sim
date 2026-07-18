@@ -32,8 +32,8 @@ lockstep NDJSON bridge (`kernel/remote.py`).
 
 ```bash
 .venv/bin/pip install -e ".[dev]"      # venv via uv; system python lacks ensurepip
-make -C c/obc && make -C c/eps && make -C cpp/comms
-cargo build --release --manifest-path rust/adcs/Cargo.toml   # rustup in ~/.cargo
+make -C backend/obc-c && make -C backend/eps-c && make -C backend/comms-cpp
+cargo build --release --manifest-path backend/adcs-rust/Cargo.toml   # rustup in ~/.cargo
 .venv/bin/pytest                        # ~4 min, all of it must stay green
 ```
 
@@ -78,12 +78,12 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
   keepers.
 - `runs/campaign1/` (local only) holds 24 flight recordings; seeds 0
   and 19 are the star flights (entries #10–#12).
-- The flight-report dashboard (`cubesat_sim.dashboard`) renders any
-  recording to self-contained HTML; the live console (`cubesat_sim.live`)
+- The flight-report dashboard (`cubesat_sim.frontend.dashboard`) renders any
+  recording to self-contained HTML; the live console (`cubesat_sim.frontend.live`)
   tails a recording over SSE — headless-browser screenshots cannot
   exercise SSE, drive real CDP if you need to verify the live page.
 - The teaching layer is shared by both viewers: `GLOSSARY` /
-  `EVENT_GLOSS` in `dashboard.py` are the single source of truth for
+  `EVENT_GLOSS` in `frontend/dashboard.py` are the single source of truth for
   term tooltips and event definitions, shipped in both the report and
   live-console boot payloads (the page-side `glossify` is duplicated in
   each template — keep them in sync). `compute_annotations(db, t_end,

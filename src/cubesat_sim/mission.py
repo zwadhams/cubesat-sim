@@ -20,10 +20,10 @@ from cubesat_sim.subsystems.payload import PayloadController
 from cubesat_sim.subsystems.thermal_ctrl import ThermalControl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-C_OBC_BIN = REPO_ROOT / "c" / "obc" / "obc"
-C_EPS_BIN = REPO_ROOT / "c" / "eps" / "eps"
-RUST_ADCS_BIN = REPO_ROOT / "rust" / "adcs" / "target" / "release" / "adcs"
-CPP_COMMS_BIN = REPO_ROOT / "cpp" / "comms" / "comms"
+C_OBC_BIN = REPO_ROOT / "backend" / "obc-c" / "obc"
+C_EPS_BIN = REPO_ROOT / "backend" / "eps-c" / "eps"
+RUST_ADCS_BIN = REPO_ROOT / "backend" / "adcs-rust" / "target" / "release" / "adcs"
+CPP_COMMS_BIN = REPO_ROOT / "backend" / "comms-cpp" / "comms"
 
 
 def build_sim(

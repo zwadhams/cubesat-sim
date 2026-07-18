@@ -13,7 +13,7 @@ of spacecraft FDIR: power-cycle the misbehaving unit. The budget is
 MAX_CYCLES per flight; after that the OBC gives up, leaves the ADCS
 powered, and lets the ground worry about it.
 
-NOTE: this file is the reference implementation. c/obc/main.c must remain
+NOTE: this file is the reference implementation. backend/obc-c/main.c must remain
 bit-identical to it — the equivalence test in tests/test_remote_obc.py
 compares whole flights. Change both or neither.
 """

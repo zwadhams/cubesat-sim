@@ -37,6 +37,7 @@ from pathlib import Path
 from cubesat_sim.frontend.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
     GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations, \
     parse_catalog
+from cubesat_sim.frontend.coastline import COASTLINE
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.linkdump import describe_link_message
 from cubesat_sim.mission import build_sim
@@ -160,7 +161,7 @@ def _lane_specs() -> list[dict]:
 def _boot_common(title: str, mode: str, meta: dict) -> dict:
     return {
         "title": title, "mode": mode, "meta": meta,
-        "orbit3d": _orbit_geometry(meta["epoch"]),
+        "orbit3d": {**_orbit_geometry(meta["epoch"]), "coast": COASTLINE},
         "lanes": _lane_specs(),
         "pills": [{"source": s, "key": k, "label": lb}
                   for s, k, lb in DIGITAL_TRACKS],
@@ -630,6 +631,12 @@ header button {
 #orbit canvas, #closeup canvas { display: block; width: 100%;
                 touch-action: none; border-radius: 6px; cursor: grab; }
 .orbit-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.glegend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px;
+           font-size: 11px; color: var(--muted); }
+.glegend i.gdot { display: inline-block; width: 8px; height: 8px;
+           border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+.glegend .stn { background: var(--s2); }
+.glegend .tgt { background: var(--s3); }
 .chip { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
         border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
 .chip.on { color: var(--ink); border-color: var(--s1); }
@@ -829,6 +836,10 @@ summary { cursor: pointer; font-size: 12.5px; }
         <span class="chip" id="eclchip">—</span>
         <span class="chip" id="conchip">—</span>
         <span class="chip" id="saachip">—</span>
+      </div>
+      <div class="glegend">
+        <span><i class="gdot stn"></i>Bozeman &mdash; ground station (downlink pass)</span>
+        <span><i class="gdot tgt"></i>Tokyo &middot; S&atilde;o&nbsp;Paulo &middot; Reykjav&iacute;k &mdash; imaging targets</span>
       </div>
     </div>
     <div class="card">
@@ -1724,19 +1735,49 @@ var globe = (function () {
     });
     ctx.fillStyle = css("--band");
     ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.fill();
-    var sv = rot(O.sun), sl = Math.hypot(sv[0], sv[2]) || 1;
+    // day / night: a gradient along the sun's screen direction, with the
+    // terminator placed exactly where the (unit) sun vector's depth component
+    // crosses — so it reads correctly from any camera angle as you rotate
+    var sv = rot(O.sun), sl = Math.hypot(sv[0], sv[2]);
+    var night = "rgba(4,10,32,0.62)", dayC = "rgba(255,243,212,0.10)";
     ctx.save();
     ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.clip();
-    ctx.translate(cx, cy);
-    ctx.rotate(Math.atan2(-sv[2], sv[0]) + Math.PI);
-    ctx.fillStyle = "rgba(0,0,0,0.10)";
-    ctx.fillRect(0, -sc, sc, 2 * sc);
+    if (sl < 1e-3) {                       // sun straight along the view axis
+      ctx.fillStyle = sv[1] < 0 ? dayC : night;
+      ctx.fillRect(cx - sc, cy - sc, 2 * sc, 2 * sc);
+    } else {
+      var dxs = sv[0] / sl, dzs = sv[2] / sl;
+      var lg = ctx.createLinearGradient(cx - dxs * sc, cy + dzs * sc,
+                                        cx + dxs * sc, cy - dzs * sc);
+      var g0 = (sv[1] + 1) / 2, tw = 0.05;
+      lg.addColorStop(0, night);
+      lg.addColorStop(Math.max(0, Math.min(1, g0 - tw)), night);
+      lg.addColorStop(Math.max(0, Math.min(1, g0 + tw)), dayC);
+      lg.addColorStop(1, dayC);
+      ctx.fillStyle = lg;
+      ctx.fillRect(cx - sc, cy - sc, 2 * sc, 2 * sc);
+    }
     ctx.restore();
     lines.forEach(function (pts) {
       polyline(pts, function (p) { return p.d >= 0; }, grid, 1, 0.9);
     });
     ctx.strokeStyle = axis; ctx.lineWidth = 1; ctx.globalAlpha = 1;
     ctx.beginPath(); ctx.arc(cx, cy, sc, 0, 2 * Math.PI); ctx.stroke();
+
+    // faint coastlines (front hemisphere only), brighter on the day side
+    if (O.coast) {
+      var coastCol = "#6f8f5e";
+      for (var ci = 0; ci < O.coast.length; ci++) {
+        var flat = O.coast[ci], cpts = [];
+        for (var vi = 0; vi < flat.length; vi += 2) {
+          var ev = latLon(flat[vi], flat[vi + 1] + lonOff), pv = P(ev);
+          pv.lit = ev[0]*O.sun[0] + ev[1]*O.sun[1] + ev[2]*O.sun[2] > 0;
+          cpts.push(pv);
+        }
+        polyline(cpts, function (p) { return p.d >= 0 && p.lit; }, coastCol, 1, 0.5);
+        polyline(cpts, function (p) { return p.d >= 0 && !p.lit; }, coastCol, 1, 0.16);
+      }
+    }
 
     var saa = [];
     var la0 = O.saa.lat[0], la1 = O.saa.lat[1],
@@ -1807,19 +1848,38 @@ var globe = (function () {
     ctx.lineWidth = 2; ctx.strokeStyle = surface; ctx.stroke();
     ctx.globalAlpha = 1;
 
-    var gx = cx + (sv[0] / sl) * sc * 1.22,
-        gy = cy - (sv[2] / sl) * sc * 1.22;
-    ctx.globalAlpha = -sv[1] >= 0 ? 0.95 : 0.55;
-    ctx.beginPath(); ctx.arc(gx, gy, 6, 0, 2 * Math.PI);
+    // subsolar point (sun directly overhead) on the near side — the clearest
+    // "where is the sun right now" cue
+    var sunFront = sv[1] < 0;
+    if (sunFront) {
+      var subx = cx + sv[0] * sc, suby = cy - sv[2] * sc;
+      ctx.beginPath(); ctx.arc(subx, suby, 3.5, 0, 2 * Math.PI);
+      ctx.fillStyle = s4; ctx.fill();
+      ctx.strokeStyle = "rgba(255,222,150,0.9)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(subx, suby, 7.5, 0, 2 * Math.PI); ctx.stroke();
+    }
+    // sun marker off the globe, with a soft glow + rays
+    var slg = sl || 1;
+    var gx = cx + (sv[0] / slg) * sc * 1.24,
+        gy = cy - (sv[2] / slg) * sc * 1.24;
+    var sgrad = ctx.createRadialGradient(gx, gy, 0, gx, gy, 24);
+    sgrad.addColorStop(0, "rgba(255,214,120,0.5)");
+    sgrad.addColorStop(1, "rgba(255,214,120,0)");
+    ctx.fillStyle = sgrad;
+    ctx.beginPath(); ctx.arc(gx, gy, 24, 0, 2 * Math.PI); ctx.fill();
+    ctx.globalAlpha = sunFront ? 1 : 0.6;
+    ctx.beginPath(); ctx.arc(gx, gy, 7, 0, 2 * Math.PI);
     ctx.fillStyle = s4; ctx.fill();
     for (var r8 = 0; r8 < 8; r8++) {
       var an = r8 * Math.PI / 4;
       ctx.beginPath();
-      ctx.moveTo(gx + Math.cos(an) * 8, gy + Math.sin(an) * 8);
-      ctx.lineTo(gx + Math.cos(an) * 11, gy + Math.sin(an) * 11);
-      ctx.strokeStyle = s4; ctx.lineWidth = 1.4; ctx.stroke();
+      ctx.moveTo(gx + Math.cos(an) * 10, gy + Math.sin(an) * 10);
+      ctx.lineTo(gx + Math.cos(an) * 14, gy + Math.sin(an) * 14);
+      ctx.strokeStyle = s4; ctx.lineWidth = 1.5; ctx.stroke();
     }
     ctx.globalAlpha = 1;
+    ctx.fillStyle = s4; ctx.font = "10px system-ui, sans-serif";
+    ctx.fillText("Sun", gx + 12, gy + 3);
 
     $("orbchip").textContent = "orbit " + (t / PERIOD_O).toFixed(2);
     var ecl = inShadow(rNow);

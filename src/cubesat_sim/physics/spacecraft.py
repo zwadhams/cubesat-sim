@@ -54,6 +54,12 @@ MIN_CHARGE_TEMP_K = CELSIUS_ZERO_K  # li-ion cold-charge cutoff
 PANEL_NORMAL_BODY = np.array([0.0, 0.0, 1.0])
 
 DEFAULT_STATION = GroundSite("bozeman", 45.68, -111.04)
+DEFAULT_STATIONS = (DEFAULT_STATION,)   # single-station default (unchanged).
+# A ground station near the Tokyo imaging AOI: captured science can be dumped in
+# the same pass it was collected, instead of waiting for a Bozeman revisit the
+# ground-track drift may not provide for many orbits. Add stations to build_sim
+# (or DEFAULT_STATIONS) to close the coverage gaps a lone station leaves.
+TOKYO_STATION = GroundSite("tokyo_gs", 35.68, 139.69)
 DEFAULT_TARGETS = (
     GroundSite("tokyo", 35.68, 139.69),
     GroundSite("sao_paulo", -23.55, -46.63),
@@ -81,6 +87,7 @@ class SpacecraftPhysics(Component):
         attitude: AttitudeDynamics | None = None,
         loads: dict[str, float] | None = None,
         station: GroundSite | None = None,
+        stations: tuple[GroundSite, ...] | list[GroundSite] | None = None,
         targets: tuple[GroundSite, ...] | None = None,
         initial_tumble_dps: float = 4.0,
         record_every_s: float = 5.0,
@@ -94,11 +101,18 @@ class SpacecraftPhysics(Component):
         self.loads = dict(loads or DEFAULT_LOADS)
         # essentials and adcs start powered; payload and heater wait for commands
         self.switches = {n: (n in ESSENTIAL_LOADS or n == "adcs") for n in self.loads}
-        self.station = station or DEFAULT_STATION
+        if stations is not None:
+            self.stations = list(stations)
+        elif station is not None:
+            self.stations = [station]
+        else:
+            self.stations = list(DEFAULT_STATIONS)
+        self.station = self.stations[0]   # primary, for any legacy reference
         self.targets = targets if targets is not None else DEFAULT_TARGETS
         self.initial_tumble_dps = initial_tumble_dps
         self._record_every_s = record_every_s
         self._prev_contact = False
+        self._active_station: str | None = None
         self._wheel_tau_cmd = np.zeros(3)
         self._mtq_m_cmd = np.zeros(3)
         self._gyro_bias: np.ndarray | None = None
@@ -245,12 +259,27 @@ class SpacecraftPhysics(Component):
         # Frames only cross while the station sees the satellite, minus loss;
         # transmitting costs watts whether or not anyone hears you.
         when = self.clock.utc
-        station_elev = self.station.elevation_deg(r_eci, when)
-        contact = station_elev > CONTACT_MIN_ELEV_DEG
+        # the satellite works whichever station gives the best geometry right
+        # now (several antennas, one ops center); that station's elevation
+        # drives the channel. A change of active station while staying in
+        # contact is a handover.
+        active = None
+        station_elev = 0.0
+        for st in self.stations:
+            el = st.elevation_deg(r_eci, when)
+            if el > CONTACT_MIN_ELEV_DEG and el > station_elev:
+                station_elev, active = el, st
+        contact = active is not None
+        active_name = active.name if active is not None else None
         if contact != self._prev_contact:
             self.event("contact_aos" if contact else "contact_los",
+                       station=(active_name or self._active_station),
                        elevation_deg=station_elev)
             self._prev_contact = contact
+        elif contact and active_name != self._active_station:
+            self.event("contact_handover", station=active_name,
+                       elevation_deg=station_elev)
+        self._active_station = active_name
         target_visible = any(
             site.elevation_deg(r_eci, when) > TARGET_MIN_ELEV_DEG
             for site in self.targets)

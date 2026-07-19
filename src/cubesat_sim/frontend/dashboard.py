@@ -48,7 +48,8 @@ from cubesat_sim.environment.groundstation import gmst_rad
 from cubesat_sim.environment.orbit import R_EARTH, CircularOrbit
 from cubesat_sim.environment.sun import sun_direction_eci
 from cubesat_sim.faults import SAA_LAT_DEG, SAA_LON_DEG
-from cubesat_sim.physics.spacecraft import DEFAULT_STATION, DEFAULT_TARGETS
+from cubesat_sim.physics.spacecraft import (
+    CONTACT_MIN_ELEV_DEG, DEFAULT_STATION, DEFAULT_TARGETS, TARGET_MIN_ELEV_DEG)
 
 # the emergent-behavior catalog, parsed at render time so findings can
 # link to the real entry text and the report stays self-contained
@@ -748,6 +749,8 @@ def load_flight(db_path: str | Path) -> dict:
                           "note": f"array at {illum[-1][1]:.3f}"})
 
         epoch_iso = json.loads(meta["epoch"]) if "epoch" in meta else None
+        stations = json.loads(meta["stations"]) if "stations" in meta else None
+        targets = json.loads(meta["targets"]) if "targets" in meta else None
         annotations = compute_annotations(db, t_end, period)
 
         return {
@@ -761,7 +764,7 @@ def load_flight(db_path: str | Path) -> dict:
             "lanes": lanes,
             "annotations": annotations,
             "catalog": parse_catalog(),
-            "orbit3d": _orbit_geometry(epoch_iso),
+            "orbit3d": _orbit_geometry(epoch_iso, stations, targets),
             "gloss": GLOSSARY,
             "evgloss": EVENT_GLOSS,
         }
@@ -769,13 +772,19 @@ def load_flight(db_path: str | Path) -> dict:
         db.close()
 
 
-def _orbit_geometry(epoch_iso: str | None) -> dict:
+def _orbit_geometry(
+    epoch_iso: str | None,
+    stations: list | None = None,
+    targets: list | None = None,
+) -> dict:
     """Everything the in-page orbit view needs, in ~300 bytes.
 
     A circular orbit is exactly `a * (e1 cos(nt) + e2 sin(nt))`, so two
     basis vectors and the mean motion reconstruct the whole path in JS.
-    Assumes the default mission geometry (orbit, station, targets) — true
-    of every flight build_sim produces today.
+    `stations`/`targets` are [name, lat, lon] triples (from the recording
+    meta, so the viewer shows the flight's actual ground segment); both
+    fall back to the single-Bozeman default when a flight predates the
+    meta or none is supplied.
     """
     orbit = CircularOrbit()
     a = orbit.semi_major_axis_m
@@ -784,10 +793,14 @@ def _orbit_geometry(epoch_iso: str | None) -> dict:
     epoch = (datetime.fromisoformat(epoch_iso) if epoch_iso
              else datetime(2026, 1, 1, tzinfo=timezone.utc))
     sun = sun_direction_eci(epoch)
-    sites = [{"name": DEFAULT_STATION.name, "lat": DEFAULT_STATION.lat_deg,
-              "lon": DEFAULT_STATION.lon_deg, "kind": "station"}]
-    sites += [{"name": s.name, "lat": s.lat_deg, "lon": s.lon_deg,
-               "kind": "target"} for s in DEFAULT_TARGETS]
+    st = stations if stations is not None else [
+        [DEFAULT_STATION.name, DEFAULT_STATION.lat_deg, DEFAULT_STATION.lon_deg]]
+    tg = targets if targets is not None else [
+        [s.name, s.lat_deg, s.lon_deg] for s in DEFAULT_TARGETS]
+    sites = [{"name": n, "lat": la, "lon": lo, "kind": "station"}
+             for n, la, lo in st]
+    sites += [{"name": n, "lat": la, "lon": lo, "kind": "target"}
+              for n, la, lo in tg]
     return {
         "r_orbit_re": _round(a / R_EARTH),
         "n_rad_s": orbit.mean_motion_rad_s,
@@ -797,6 +810,8 @@ def _orbit_geometry(epoch_iso: str | None) -> dict:
         "gmst0_rad": _round(gmst_rad(epoch)),
         "w_earth_rad_s": math.radians(360.98564736629) / 86400.0,
         "sites": sites,
+        "contact_min_elev": CONTACT_MIN_ELEV_DEG,
+        "target_min_elev": TARGET_MIN_ELEV_DEG,
         "saa": {"lat": list(SAA_LAT_DEG), "lon": list(SAA_LON_DEG)},
     }
 
@@ -1552,7 +1567,8 @@ function drawOrbitView() {
   range.type = "range"; range.min = 0; range.max = T_END;
   range.step = Math.max(1, T_END / 2000); bar.appendChild(range);
   var orbChip = div("chip", bar), eclChip = div("chip", bar),
-      conChip = div("chip", bar);
+      conChip = div("chip", bar), imgChip = div("chip", bar),
+      beamChip = div("chip", bar);
 
   var reduced = window.matchMedia &&
       matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1561,10 +1577,13 @@ function drawOrbitView() {
   // or restarts the clock
   if (!orbitUI) {
     orbitUI = { yaw: -0.9, pitch: 0.38, oT: 0, playing: !reduced,
-                speed: "300" };
+                speed: "300", showBeam: true };
   }
   var vs = orbitUI;
   var last = null, raf = null;
+  // link-beam edge/flash state (see the live console): visual only
+  var prevContact = false, prevImaging = false,
+      gsFlashAt = -1e9, imgFlashAt = -1e9;
   var cx = W / 2, cy = H / 2;
   var s = (Math.min(W, H) / 2 - 8) / 1.32;
   var PERIOD_O = 2 * Math.PI / O.n_rad_s;
@@ -1595,6 +1614,45 @@ function drawOrbitView() {
     var lo = lon * Math.PI / 180 + O.gmst0_rad + O.w_earth_rad_s * t;
     return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
             Math.sin(la)];
+  }
+  function targetElev(site, t) {
+    // satellite elevation above the site — mirror of GroundSite.elevation_deg
+    // (siteEci is already a unit vector: site radius = 1 Earth radius).
+    var st = siteEci(site.lat, site.lon, t), r = satPos(t);
+    var rx = r[0] - st[0], ry = r[1] - st[1], rz = r[2] - st[2];
+    var rn = Math.hypot(rx, ry, rz) || 1;
+    var sinEl = (rx * st[0] + ry * st[1] + rz * st[2]) / rn;
+    return Math.asin(Math.max(-1, Math.min(1, sinEl))) * 180 / Math.PI;
+  }
+  function drawBeam(a, b, col, now, flashAt) {
+    // a = satellite, b = ground point (screen coords): a tapered cone narrow at
+    // the spacecraft and wide at the ground footprint, an animated dashed core
+    // scanning toward the ground, plus a footprint ring and acquire flash.
+    var dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
+    var nx = -dy / L, ny = dx / L, wSat = 1.5, wTgt = 9;
+    ctx.save();
+    ctx.fillStyle = col; ctx.globalAlpha = 0.15;
+    ctx.beginPath();
+    ctx.moveTo(a.x + nx * wSat, a.y + ny * wSat);
+    ctx.lineTo(b.x + nx * wTgt, b.y + ny * wTgt);
+    ctx.lineTo(b.x - nx * wTgt, b.y - ny * wTgt);
+    ctx.lineTo(a.x - nx * wSat, a.y - ny * wSat);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.globalAlpha = 0.9;
+    ctx.setLineDash([6, 6]); ctx.lineDashOffset = -(now / 45) % 12;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 4.5 + 1.2 * Math.sin(now / 180), 0, 2 * Math.PI);
+    ctx.stroke();
+    var f = (now - flashAt) / 500;
+    if (f >= 0 && f < 1) {
+      ctx.globalAlpha = (1 - f) * 0.9;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 6 + f * 22, 0, 2 * Math.PI); ctx.stroke();
+    }
+    ctx.restore();
   }
   function latLon(lat, lon) {
     var la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
@@ -1726,11 +1784,38 @@ function drawOrbitView() {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    if (trackOn("ground contact", vs.oT)) {
-      var stn = O.sites[0], gp = P(siteEci(stn.lat, stn.lon, vs.oT));
-      ctx.strokeStyle = s2; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
-      ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(sp.x, sp.y);
-      ctx.stroke(); ctx.globalAlpha = 1;
+    // ground-station downlink beam + imaging capture beam — same animated
+    // treatment as the live console. Contact/imaging come from the recorded
+    // digital tracks; which target is chosen is geometry (targetElev). The
+    // dashes animate while the report is playing; a scrubbed pause is static.
+    var now = performance.now();
+    var contact = trackOn("ground contact", vs.oT);
+    if (contact && !prevContact) gsFlashAt = now;
+    prevContact = contact;
+    if (vs.showBeam && contact) {
+      var gs = null, gbest = O.contact_min_elev;
+      for (var gi = 0; gi < O.sites.length; gi++) {
+        if (O.sites[gi].kind !== "station") continue;
+        var gel = targetElev(O.sites[gi], vs.oT);   // reused elevation helper
+        if (gel > gbest) { gbest = gel; gs = O.sites[gi]; }
+      }
+      if (gs) {
+        var gp = P(siteEci(gs.lat, gs.lon, vs.oT));
+        if (gp.d > 0 && !occluded(gp)) drawBeam(sp, gp, s2, now, gsFlashAt);
+      }
+    }
+    var imaging = trackOn("imaging", vs.oT);
+    if (imaging && !prevImaging) imgFlashAt = now;
+    prevImaging = imaging;
+    var imgTgt = null, bestEl = O.target_min_elev;
+    for (var si = 0; si < O.sites.length; si++) {
+      if (O.sites[si].kind !== "target") continue;
+      var el = targetElev(O.sites[si], vs.oT);
+      if (el > bestEl) { bestEl = el; imgTgt = O.sites[si]; }
+    }
+    if (vs.showBeam && imaging && imgTgt) {
+      var tp = P(siteEci(imgTgt.lat, imgTgt.lon, vs.oT));
+      if (tp.d > 0 && !occluded(tp)) drawBeam(sp, tp, s3, now, imgFlashAt);
     }
     ctx.globalAlpha = occluded(sp) ? 0.35 : 1;
     ctx.beginPath(); ctx.arc(sp.x, sp.y, 5, 0, 2 * Math.PI);
@@ -1758,6 +1843,9 @@ function drawOrbitView() {
     conChip.textContent = trackOn("ground contact", vs.oT)
       ? "in contact" : "no contact";
     conChip.className = "chip" + (trackOn("ground contact", vs.oT) ? " on" : "");
+    imgChip.textContent = imaging ? "imaging"
+      : (imgTgt ? "target in view" : "no target");
+    imgChip.className = "chip" + (imaging ? " on" : "");
   }
 
   function frame(ts) {
@@ -1784,6 +1872,17 @@ function drawOrbitView() {
   });
   speedSel.addEventListener("change", function () {
     vs.speed = speedSel.value; last = null;
+  });
+  beamChip.style.cursor = "pointer";
+  beamChip.title = "show/hide the link beams (downlink + imaging)";
+  function paintBeamChip() {
+    beamChip.textContent = vs.showBeam ? "beam ✓" : "beam";
+    beamChip.className = "chip" + (vs.showBeam ? " on" : "");
+  }
+  paintBeamChip();
+  beamChip.addEventListener("click", function () {
+    vs.showBeam = !vs.showBeam; paintBeamChip();
+    if (!vs.playing) render();
   });
 
   var dragging = false, lx = 0, ly = 0;

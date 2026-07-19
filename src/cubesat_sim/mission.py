@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from cubesat_sim.environment.groundstation import GroundSite
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.faults import FaultInjector, ScheduledFault
 from cubesat_sim.kernel.remote import RemoteComponent
@@ -36,6 +37,7 @@ def build_sim(
     initial_soc: float = 0.85,
     thermal_sun_w: float = 36.0,
     initial_tumble_dps: float = 4.0,
+    stations: tuple[GroundSite, ...] | list[GroundSite] | None = None,
     payload_rate_mb_s: float = 0.25,
     battery_fade_per_wh: float = 2e-4,
     array_decay_per_year: float = 0.025,
@@ -62,7 +64,7 @@ def build_sim(
     """
     sim = Simulation(dt=dt, seed=seed, recorder_path=recorder_path, epoch=epoch)
     orbit = CircularOrbit()
-    sim.add(SpacecraftPhysics(
+    physics = SpacecraftPhysics(
         orbit=orbit,
         array=SolarArray(illumination=illumination,
                          decay_per_year=array_decay_per_year),
@@ -73,7 +75,16 @@ def build_sim(
             wheel_friction_growth_per_s=wheel_friction_growth_per_s,
         )),
         initial_tumble_dps=initial_tumble_dps,
-    ))
+        stations=stations,
+    )
+    sim.add(physics)
+    # record the ground/target geometry so a viewer renders the flight's actual
+    # config (which stations were up), not the hardcoded default. set_meta
+    # JSON-encodes each value itself, so pass raw lists (not json.dumps).
+    sim.recorder.set_meta(
+        stations=[[s.name, s.lat_deg, s.lon_deg] for s in physics.stations],
+        targets=[[s.name, s.lat_deg, s.lon_deg] for s in physics.targets],
+    )
     if eps_impl == "python":
         sim.add(EPS())
     elif eps_impl == "c":

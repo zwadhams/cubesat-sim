@@ -161,7 +161,8 @@ def _lane_specs() -> list[dict]:
 def _boot_common(title: str, mode: str, meta: dict) -> dict:
     return {
         "title": title, "mode": mode, "meta": meta,
-        "orbit3d": {**_orbit_geometry(meta["epoch"]), "coast": COASTLINE},
+        "orbit3d": {**_orbit_geometry(meta["epoch"], meta.get("stations"),
+                                      meta.get("targets")), "coast": COASTLINE},
         "lanes": _lane_specs(),
         "pills": [{"source": s, "key": k, "label": lb}
                   for s, k, lb in DIGITAL_TRACKS],
@@ -170,9 +171,12 @@ def _boot_common(title: str, mode: str, meta: dict) -> dict:
 
 
 def _live_boot(sim, duration_s: float, db_path: Path) -> dict:
+    phys = next(c for c in sim.components if c.name == "physics")
+    triples = lambda sites: [[s.name, s.lat_deg, s.lon_deg] for s in sites]
     return _boot_common(db_path.stem, "live", {
         "seed": sim.seed, "dt": sim.dt,
         "epoch": sim.clock.epoch.isoformat(),
+        "stations": triples(phys.stations), "targets": triples(phys.targets),
         "duration_s": round(duration_s, 2), "period_s": round(_PERIOD, 2)})
 
 
@@ -187,6 +191,8 @@ def _replay_boot(db_path: Path) -> tuple[dict, float, float]:
     boot = _boot_common(db_path.stem, "replay", {
         "seed": json.loads(meta.get("seed", "0")), "dt": dt,
         "epoch": json.loads(meta["epoch"]) if "epoch" in meta else None,
+        "stations": json.loads(meta["stations"]) if "stations" in meta else None,
+        "targets": json.loads(meta["targets"]) if "targets" in meta else None,
         "duration_s": round(t_end, 2), "period_s": round(_PERIOD, 2)})
     return boot, t_end, dt
 
@@ -637,6 +643,8 @@ header button {
            border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 .glegend .stn { background: var(--s2); }
 .glegend .tgt { background: var(--s3); }
+.glegend .beam { background: var(--s3);
+           box-shadow: 0 0 0 2px color-mix(in srgb, var(--s3) 35%, transparent); }
 .chip { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
         border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
 .chip.on { color: var(--ink); border-color: var(--s1); }
@@ -835,11 +843,15 @@ summary { cursor: pointer; font-size: 12.5px; }
         <span class="chip" id="orbchip">orbit 0.00</span>
         <span class="chip" id="eclchip">—</span>
         <span class="chip" id="conchip">—</span>
+        <span class="chip" id="imgchip">—</span>
         <span class="chip" id="saachip">—</span>
+        <span class="chip on" id="beamtgl" style="cursor:pointer"
+              title="show/hide the link beams (downlink + imaging)">beam &#10003;</span>
       </div>
       <div class="glegend">
-        <span><i class="gdot stn"></i>Bozeman &mdash; ground station (downlink pass)</span>
-        <span><i class="gdot tgt"></i>Tokyo &middot; S&atilde;o&nbsp;Paulo &middot; Reykjav&iacute;k &mdash; imaging targets</span>
+        <span><i class="gdot stn"></i><span id="lg-stn"></span> &mdash; ground station(s) (downlink pass)</span>
+        <span><i class="gdot tgt"></i><span id="lg-tgt"></span> &mdash; imaging targets</span>
+        <span><i class="gdot beam"></i>animated beam &mdash; an active link: green downlink &middot; pink imaging</span>
       </div>
     </div>
     <div class="card">
@@ -1637,6 +1649,10 @@ var globe = (function () {
   host.appendChild(canvas);
   var vs = { yaw: -0.9, pitch: 0.38 };
   var W = 0, H = 0, cx = 0, cy = 0, sc = 1, ctx = null;
+  // link beams (downlink + imaging capture): user-toggleable (default on),
+  // each with an "acquire" flash on its rising edge. Visual only — no sim state.
+  var showBeam = true, prevImaging = false, imgFlashAt = -1e9,
+      prevContact = false, gsFlashAt = -1e9;
   function size() {
     var w = host.clientWidth;
     if (w < 40) return false;
@@ -1675,6 +1691,45 @@ var globe = (function () {
     var lo = lon * Math.PI / 180 + O.gmst0_rad + O.w_earth_rad_s * t;
     return [Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo),
             Math.sin(la)];
+  }
+  function targetElev(site, t) {
+    // satellite elevation above the site — mirror of GroundSite.elevation_deg
+    // (siteEci is already a unit vector: site radius = 1 Earth radius).
+    var s = siteEci(site.lat, site.lon, t), r = satPos(t);
+    var rx = r[0] - s[0], ry = r[1] - s[1], rz = r[2] - s[2];
+    var rn = Math.hypot(rx, ry, rz) || 1;
+    var sinEl = (rx * s[0] + ry * s[1] + rz * s[2]) / rn;
+    return Math.asin(Math.max(-1, Math.min(1, sinEl))) * 180 / Math.PI;
+  }
+  function drawBeam(a, b, col, now, flashAt) {
+    // a = satellite, b = ground point (screen coords): a tapered cone narrow at
+    // the spacecraft and wide at the ground footprint, an animated dashed core
+    // scanning toward the ground, plus a footprint ring and acquire flash.
+    var dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy) || 1;
+    var nx = -dy / L, ny = dx / L, wSat = 1.5, wTgt = 9;
+    ctx.save();
+    ctx.fillStyle = col; ctx.globalAlpha = 0.15;
+    ctx.beginPath();
+    ctx.moveTo(a.x + nx * wSat, a.y + ny * wSat);
+    ctx.lineTo(b.x + nx * wTgt, b.y + ny * wTgt);
+    ctx.lineTo(b.x - nx * wTgt, b.y - ny * wTgt);
+    ctx.lineTo(a.x - nx * wSat, a.y - ny * wSat);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.globalAlpha = 0.9;
+    ctx.setLineDash([6, 6]); ctx.lineDashOffset = -(now / 45) % 12;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 4.5 + 1.2 * Math.sin(now / 180), 0, 2 * Math.PI);
+    ctx.stroke();
+    var f = (now - flashAt) / 500;
+    if (f >= 0 && f < 1) {
+      ctx.globalAlpha = (1 - f) * 0.9;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 6 + f * 22, 0, 2 * Math.PI); ctx.stroke();
+    }
+    ctx.restore();
   }
   function latLon(lat, lon) {
     var la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
@@ -1836,11 +1891,40 @@ var globe = (function () {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    if (lv("physics/gs_contact") >= 0.5) {
-      var stn0 = O.sites[0], gp = P(siteEci(stn0.lat, stn0.lon, t));
-      ctx.strokeStyle = s2; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
-      ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(sp.x, sp.y);
-      ctx.stroke(); ctx.globalAlpha = 1;
+    // ground-station downlink beam — same animated treatment as imaging, in
+    // the station's green; flashes on acquisition of signal (contact AOS).
+    var contact = lv("physics/gs_contact") >= 0.5;
+    if (contact && !prevContact) gsFlashAt = performance.now();
+    prevContact = contact;
+    if (showBeam && contact) {
+      var gs = null, gbest = O.contact_min_elev;
+      for (var gi = 0; gi < O.sites.length; gi++) {
+        if (O.sites[gi].kind !== "station") continue;
+        var gel = targetElev(O.sites[gi], t);   // reused elevation helper
+        if (gel > gbest) { gbest = gel; gs = O.sites[gi]; }
+      }
+      if (gs) {
+        var gp = P(siteEci(gs.lat, gs.lon, t));
+        if (gp.d > 0 && !occluded(gp))
+          drawBeam(sp, gp, s2, performance.now(), gsFlashAt);
+      }
+    }
+    // imaging capture beam — which target is above the look-angle limit is
+    // recomputed from ephemeris; whether we're actually capturing is telemetry
+    // (payload/imaging = powered & enabled & a target visible).
+    var imaging = lv("payload/imaging") >= 0.5;
+    if (imaging && !prevImaging) imgFlashAt = performance.now();
+    prevImaging = imaging;
+    var imgTgt = null, bestEl = O.target_min_elev;
+    for (var si = 0; si < O.sites.length; si++) {
+      if (O.sites[si].kind !== "target") continue;
+      var el = targetElev(O.sites[si], t);
+      if (el > bestEl) { bestEl = el; imgTgt = O.sites[si]; }
+    }
+    if (showBeam && imaging && imgTgt) {
+      var tp = P(siteEci(imgTgt.lat, imgTgt.lon, t));
+      if (tp.d > 0 && !occluded(tp))
+        drawBeam(sp, tp, s3, performance.now(), imgFlashAt);
     }
     ctx.globalAlpha = occluded(sp) ? 0.35 : 1;
     ctx.beginPath(); ctx.arc(sp.x, sp.y, 5, 0, 2 * Math.PI);
@@ -1888,6 +1972,9 @@ var globe = (function () {
     var con = lv("physics/gs_contact") >= 0.5;
     $("conchip").textContent = con ? "in contact" : "no contact";
     $("conchip").className = "chip" + (con ? " on" : "");
+    $("imgchip").textContent = imaging ? "imaging"
+      : (imgTgt ? "target in view" : "no target");
+    $("imgchip").className = "chip" + (imaging ? " on" : "");
     // sub-satellite point vs the SAA box (same box the fault injector uses)
     var rl = Math.hypot(rNow[0], rNow[1], rNow[2]) || 1;
     var rlat = Math.asin(rNow[2] / rl) * 180 / Math.PI;
@@ -1912,6 +1999,19 @@ var globe = (function () {
   });
   canvas.addEventListener("pointerup", function () { dragging = false; });
   canvas.addEventListener("pointercancel", function () { dragging = false; });
+  var lgStn = [], lgTgt = [];
+  O.sites.forEach(function (s) {
+    (s.kind === "station" ? lgStn : lgTgt).push(s.name);
+  });
+  if ($("lg-stn")) $("lg-stn").textContent = lgStn.join(" · ");
+  if ($("lg-tgt")) $("lg-tgt").textContent = lgTgt.join(" · ");
+  var beamBtn = $("beamtgl");
+  if (beamBtn) beamBtn.addEventListener("click", function () {
+    showBeam = !showBeam;
+    beamBtn.className = "chip" + (showBeam ? " on" : "");
+    beamBtn.textContent = showBeam ? "beam ✓" : "beam";
+    if (reduced) render(displayTime());
+  });
   return { render: render };
 })();
 

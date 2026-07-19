@@ -181,3 +181,60 @@ To fly with the C flight software instead of the Python references:
 `build_sim(obc_impl="c", eps_impl="c")`. Observed emergent behaviors are cataloged in
 [EMERGENT_BEHAVIORS.md](EMERGENT_BEHAVIORS.md) — the policy is to keep and
 document them unless they break simulation integrity.
+
+## Configuring the ground network
+
+The mission flies a single ground station by default (Bozeman, 45.7°N
+111°W). A station is just a named site — `GroundSite(name, lat, lon)` —
+and `build_sim` takes a list of them, so adding coverage is a one-liner.
+The satellite works whichever visible station has the best elevation
+(several antennas, one ops center); a change of active station mid-pass
+is logged as a `contact_handover` event.
+
+```python
+from cubesat_sim.environment.groundstation import GroundSite
+from cubesat_sim.environment.orbit import CircularOrbit
+from cubesat_sim.physics.spacecraft import DEFAULT_STATION, TOKYO_STATION
+from cubesat_sim.mission import build_sim
+
+sao_paulo_gs = GroundSite("sao_paulo_gs", -23.55, -46.63)   # name, lat, lon
+
+sim = build_sim(
+    seed=1,
+    recorder_path="runs/threestation.db",
+    stations=[DEFAULT_STATION, TOKYO_STATION, sao_paulo_gs],
+)
+sim.run(duration=12 * CircularOrbit().period_s)   # 12 orbits
+sim.close()
+```
+
+Nothing else needs wiring: `build_sim` records the station geometry into
+the flight recording, so the report and live console render every
+station straight from it — its marker, its green downlink beam, the
+`ground contact ×N` count, and the map legend:
+
+```bash
+.venv/bin/python -m cubesat_sim.frontend.dashboard runs/threestation.db
+.venv/bin/python -m cubesat_sim.frontend.live --replay runs/threestation.db
+```
+
+**Where to put one.** The default orbit is 51.6° inclined, so the ground
+track only reaches ±51.6° latitude:
+
+- Keep a station's latitude inside that band — a higher-latitude site
+  only ever sees the satellite low on the horizon, so a polar station
+  does *not* help this orbit.
+- Spread stations in longitude, ideally near an imaging target, to catch
+  the passes a lone station misses as its ground track drifts west — and
+  to downlink science in the same pass it was captured. (One station near
+  Tokyo took stranded science from 79% to 27% on a 12-orbit flight.)
+- A pass opens above `CONTACT_MIN_ELEV_DEG` (10° elevation); raise it in
+  `cubesat_sim.physics.spacecraft` to model terrain masking.
+
+Passing `stations=` per run is deterministic and leaves the
+single-station default — and every existing recording — untouched. To
+make a network the default for *every* flight, edit `DEFAULT_STATIONS` in
+`cubesat_sim.physics.spacecraft`; that is a deliberate change, since it
+moves all default recordings. The live console builds its own sim and has
+no `--stations` flag yet, so a live (non-`--replay`) multi-station flight
+currently means a short `build_sim` script.

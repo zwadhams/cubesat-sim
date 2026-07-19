@@ -625,10 +625,10 @@ header button {
 .tile .vl.warn { color: var(--serious); }
 .tile .nt { font-size: 11.5px; color: var(--muted); margin-top: 1px;
             min-height: 15px; font-variant-numeric: tabular-nums; }
-.duo { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 840px) { .duo { grid-template-columns: 1fr; } }
-#orbit canvas { display: block; width: 100%; touch-action: none;
-                border-radius: 6px; cursor: grab; }
+#orbit canvas, #closeup canvas { display: block; width: 100%;
+                touch-action: none; border-radius: 6px; cursor: grab; }
 .orbit-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .chip { font-size: 11.5px; color: var(--muted); border: 1px solid var(--border);
         border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
@@ -832,11 +832,23 @@ summary { cursor: pointer; font-size: 12.5px; }
       </div>
     </div>
     <div class="card">
-      <h2>Spacecraft state</h2>
-      <div class="pills" id="pills"></div>
-      <h2 style="margin:14px 0 6px">Events</h2>
-      <div class="feed" id="events"></div>
+      <h2>Attitude <span class="zinfo">drag to rotate &middot; 3rd-person</span></h2>
+      <div id="closeup"></div>
+      <div class="orbit-chips">
+        <span class="chip" id="attlit">&mdash;</span>
+        <span class="chip" id="attsun">sun &mdash;</span>
+        <span class="chip" id="attrate">rate &mdash;</span>
+        <span class="chip" id="atttech" style="cursor:pointer"
+              title="show orientation cues">tech</span>
+      </div>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Spacecraft state</h2>
+    <div class="pills" id="pills"></div>
+    <h2 style="margin:14px 0 6px">Events</h2>
+    <div class="feed" id="events"></div>
   </div>
 
   <div class="card">
@@ -1110,7 +1122,7 @@ function drawFindings(notes) {
 /* ---- state ---- */
 var state = {
   simTime: 0, tick: 0, paused: false, speed: 30, done: false,
-  statusWall: null, mode: BOOT.mode,
+  statusWall: null, tickSimTime: 0, tickWall: null, mode: BOOT.mode,
 };
 var latest = {};       // "source/key" -> [t, value]
 var laneIndex = {};    // "source/key" -> [series buffer, ...]
@@ -1123,10 +1135,13 @@ function lv(key) {
   return e ? e[1] : null;
 }
 function displayTime() {
-  if (state.statusWall === null || state.paused || state.done ||
+  // advance smoothly from the last tick's sim time at the paced speed, so the
+  // clock ticks in real time at 1x instead of jumping one dt per tick; capped
+  // at one tick so a stalled stream can never run the clock away
+  if (state.tickWall === null || state.paused || state.done ||
       state.speed === null) return state.simTime;
-  var e = (performance.now() - state.statusWall) / 1000;
-  return state.simTime + Math.min(e, 1.5) * state.speed;
+  var e = (performance.now() - state.tickWall) / 1000;
+  return state.tickSimTime + Math.min(e * state.speed, BOOT.meta.dt);
 }
 
 /* ---- header chips ---- */
@@ -1840,9 +1855,369 @@ var globe = (function () {
   return { render: render };
 })();
 
+/* ---- close-up attitude view: true attitude over an orbital scene --------
+   The globe shows WHERE the satellite is; this shows HOW it is oriented in
+   sunlight. The recorded body-from-ECI quaternion (physics/q0..q3) rotates
+   the body into ECI where the sun sits, so which faces are lit and whether
+   it is in eclipse are physically real. The Earth limb + starfield are a
+   fixed "postcard" backdrop; technical cues (sun-axis arrow, tumble arcs)
+   hide behind the `tech` chip. Hand-rolled 2D approximation, no 3D engine. */
+var closeup = (function () {
+  var host = $("closeup"), O = BOOT.orbit3d;
+  var canvas = document.createElement("canvas");
+  host.appendChild(canvas);
+  // pick a "home" camera that lifts the sun into the sky (never into Earth),
+  // whatever the mission epoch's sun direction happens to be
+  function homeFromSun() {
+    var s = O.sun, best = { yaw: 0.6, pitch: 0.32 }, bestScore = -1e9, yi, pi;
+    for (yi = 0; yi < 48; yi++) {
+      var yy = -Math.PI + yi * Math.PI / 24;
+      var cc = Math.cos(yy), sn = Math.sin(yy);
+      var x = s[0]*cc - s[1]*sn, y = s[0]*sn + s[1]*cc, z = s[2];
+      for (pi = 0; pi <= 20; pi++) {
+        var pp = -1.0 + pi * 0.1, cp = Math.cos(pp), sp = Math.sin(pp);
+        var up = y*sp + z*cp, depth = y*cp - z*sp;   // up = screen +z, depth +y
+        var score = up - 0.20*Math.max(0, depth) - 0.15*Math.abs(pp) + 0.30*x;
+        if (score > bestScore) { bestScore = score; best = { yaw: yy, pitch: pp }; }
+      }
+    }
+    return best;
+  }
+  var home = homeFromSun();
+  var vs = { yaw: home.yaw, pitch: home.pitch };
+  var showTech = false, lastInteract = 0;
+  var W = 0, H = 0, cx = 0, cy = 0, sc = 1, ctx = null;
+  function size() {
+    var w = host.clientWidth;
+    if (w < 40) return false;
+    var h = Math.max(220, Math.min(400, Math.round(w * 0.62)));
+    var dpr = window.devicePixelRatio || 1;
+    if (W !== w || H !== h) {
+      W = w; H = h;
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+      canvas.style.width = w + "px"; canvas.style.height = h + "px";
+      cx = W / 2; cy = H / 2;
+      sc = (Math.min(W, H) / 2 - 10) / 2.8;
+      ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    return true;
+  }
+  function rot(v) {                 // camera yaw/pitch, shared with the globe
+    var c = Math.cos(vs.yaw), sn = Math.sin(vs.yaw);
+    var x = v[0] * c - v[1] * sn, y = v[0] * sn + v[1] * c, z = v[2];
+    var cp = Math.cos(vs.pitch), sp = Math.sin(vs.pitch);
+    return [x, y * cp - z * sp, y * sp + z * cp];
+  }
+  function P(v) {
+    var r = rot(v);
+    return { x: cx + r[0] * sc, y: cy - r[2] * sc, d: -r[1] };
+  }
+  // body-from-ECI DCM, scalar-first — mirrors dcm_from_quat in attitude.py
+  function dcm(q) {
+    var w = q[0], x = q[1], y = q[2], z = q[3];
+    return [[w*w+x*x-y*y-z*z, 2*(x*y+w*z),     2*(x*z-w*y)],
+            [2*(x*y-w*z),     w*w-x*x+y*y-z*z, 2*(y*z+w*x)],
+            [2*(x*z+w*y),     2*(y*z-w*x),     w*w-x*x-y*y+z*z]];
+  }
+  function toEci(A, v) {            // ECI image of a body vector = A^T v
+    return [A[0][0]*v[0]+A[1][0]*v[1]+A[2][0]*v[2],
+            A[0][1]*v[0]+A[1][1]*v[1]+A[2][1]*v[2],
+            A[0][2]*v[0]+A[1][2]*v[1]+A[2][2]*v[2]];
+  }
+  function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+  function col(a) { return "rgb(" + (a[0]|0) + "," + (a[1]|0) + "," + (a[2]|0) + ")"; }
+  function mix(a, b, t) {
+    return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+  }
+  function arrow(a, bx, by, col, wid) {
+    ctx.strokeStyle = col; ctx.lineWidth = wid;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(bx, by); ctx.stroke();
+    var ang = Math.atan2(by - a.y, bx - a.x), h = 7;
+    ctx.beginPath(); ctx.moveTo(bx, by);
+    ctx.lineTo(bx - h*Math.cos(ang - 0.4), by - h*Math.sin(ang - 0.4));
+    ctx.lineTo(bx - h*Math.cos(ang + 0.4), by - h*Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+  }
+
+  // 3U bus (long along +Z), unit corners scaled by BUS; six outward faces
+  var BUS = [0.42, 0.42, 1.25], MET = [150, 160, 176];
+  var faces = [
+    { n:[0,0,1],  v:[[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]] },
+    { n:[0,0,-1], v:[[-1,-1,-1],[-1,1,-1],[1,1,-1],[1,-1,-1]] },
+    { n:[1,0,0],  v:[[1,-1,-1],[1,1,-1],[1,1,1],[1,-1,1]] },
+    { n:[-1,0,0], v:[[-1,-1,-1],[-1,-1,1],[-1,1,1],[-1,1,-1]] },
+    { n:[0,1,0],  v:[[-1,1,-1],[-1,1,1],[1,1,1],[1,1,-1]] },
+    { n:[0,-1,0], v:[[-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1]] }
+  ];
+  // two deployed panels in the body XY-plane, normal +Z (== PANEL_NORMAL_BODY)
+  var PANEL = [30, 52, 130];
+  var panels = [
+    [[0.42,-0.55,0.03],[1.75,-0.55,0.03],[1.75,0.55,0.03],[0.42,0.55,0.03]],
+    [[-0.42,-0.55,0.03],[-0.42,0.55,0.03],[-1.75,0.55,0.03],[-1.75,-0.55,0.03]]
+  ];
+
+  // deterministic starfield + clouds (seeded, so they don't jitter each frame)
+  function rng(s) { return function () { s |= 0; s = s + 0x6D2B79F5 | 0;
+    var x = Math.imul(s ^ s >>> 15, 1 | s); x = x + Math.imul(x ^ x >>> 7, 61 | x) ^ x;
+    return ((x ^ x >>> 14) >>> 0) / 4294967296; }; }
+  var _r = rng(1927), stars = [], clouds = [], _i;
+  for (_i = 0; _i < 80; _i++) stars.push({ x: _r(), y: _r() * 0.6,
+    r: 0.4 + _r() * 1.1, a: 0.25 + _r() * 0.6 });
+  for (_i = 0; _i < 12; _i++) clouds.push({ x: _r(), y: 0.10 + _r() * 0.78,
+    r: 24 + _r() * 46, a: 0.14 + _r() * 0.2 });
+  var land = [];   // dim ocean-tone patches beneath the clouds (parallax layer)
+  for (_i = 0; _i < 9; _i++) land.push({ x: _r(), y: 0.16 + _r() * 0.78,
+    r: 44 + _r() * 74, a: 0.10 + _r() * 0.12, dark: _r() < 0.5 });
+
+  // scene materials — always a dark space view, independent of page theme
+  var SPACE_TOP=[6,8,16], SPACE_LOW=[12,18,40];
+  var OCEAN_HI=[36,96,176], OCEAN_LO=[9,32,84];
+  var NIGHT_HI=[10,22,44], NIGHT_LO=[4,9,22];
+  var BUS_DK=[26,28,34], BUS_LT=[208,204,190];   // charcoal bus -> sunlit metal
+  var PAN_DK=[18,26,58], PAN_LT=[120,152,224];   // dark cells -> lit blue
+  var GOLD=[255,206,120], SUNCORE=[255,248,232];
+  var HORIZON = 0.60;   // Earth's top edge, as a fraction of card height
+
+  // one scrolling layer of soft blobs (ocean tone or cloud), wrapped in x
+  function drawBlobs(arr, drift, yBand, ecl, cloud) {
+    for (var i = 0; i < arr.length; i++) {
+      var b = arr[i], base = b.x - drift; base = base - Math.floor(base);
+      var yy = H * HORIZON + b.y * yBand;
+      var a = b.a * (ecl ? (cloud ? 0 : 0.5) : 1);
+      if (a <= 0) continue;
+      var cc = cloud ? "240,244,250" : (b.dark ? "6,26,66" : "70,130,205");
+      for (var w = -1; w <= 1; w++) {
+        var bx = base * W + w * W;
+        if (bx < -b.r || bx > W + b.r) continue;
+        var rg = ctx.createRadialGradient(bx, yy, 0, bx, yy, b.r);
+        rg.addColorStop(0, "rgba(" + cc + "," + a + ")");
+        rg.addColorStop(1, "rgba(" + cc + ",0)");
+        ctx.fillStyle = rg;
+        ctx.beginPath(); ctx.ellipse(bx, yy, b.r, b.r * 0.5, 0, 0, 2*Math.PI); ctx.fill();
+      }
+    }
+  }
+  function drawScene(ecl, t) {
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, col(SPACE_TOP)); g.addColorStop(1, col(SPACE_LOW));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    var s, st;
+    for (s = 0; s < stars.length; s++) {
+      st = stars[s];
+      ctx.globalAlpha = st.a * (ecl ? 1 : 0.85); ctx.fillStyle = "#dfe7ff";
+      ctx.beginPath(); ctx.arc(st.x * W, st.y * H, st.r, 0, 2*Math.PI); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Earth disc — huge radius centred far below, only its top cap shows
+    var eR = Math.max(W, H) * 1.7, eCy = H * HORIZON + eR, yBand = H - H * HORIZON;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, eCy, eR, 0, 2*Math.PI);
+    var eg = ctx.createLinearGradient(0, H * HORIZON, 0, H);
+    eg.addColorStop(0, col(ecl ? NIGHT_HI : OCEAN_HI));
+    eg.addColorStop(1, col(ecl ? NIGHT_LO : OCEAN_LO));
+    ctx.fillStyle = eg; ctx.fill(); ctx.clip();
+    // surface features scroll to sell orbital motion; clouds drift a touch
+    // faster than the ocean tone beneath (parallax). Speed tracks orbital
+    // phase, so it scales with sim speed automatically (slow at 1x).
+    var ph = t * O.n_rad_s;
+    drawBlobs(land, ph * 0.36, yBand, ecl, false);
+    drawBlobs(clouds, ph * 0.52, yBand, ecl, true);
+    ctx.restore();
+    ctx.save();                                    // atmosphere rim glow
+    ctx.strokeStyle = "rgba(130,190,255,0.55)";
+    ctx.shadowColor = "rgba(130,190,255,0.9)"; ctx.shadowBlur = 18;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(cx, eCy, eR + 1.5, 0, 2*Math.PI); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSun(sunx, suny, behind) {
+    var bloom = ctx.createRadialGradient(sunx, suny, 0, sunx, suny, 130);
+    bloom.addColorStop(0, "rgba(255,224,150," + (behind ? 0.32 : 0.6) + ")");
+    bloom.addColorStop(0.4, "rgba(255,205,120,0.2)");
+    bloom.addColorStop(1, "rgba(255,205,120,0)");
+    ctx.fillStyle = bloom; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = behind ? 0.25 : 0.5; ctx.strokeStyle = col(GOLD);
+    ctx.lineWidth = 1.4;
+    for (var k = 0; k < 12; k++) {
+      var an = k * Math.PI / 6, r0 = 22, r1 = 32 + (k % 2) * 9;
+      ctx.beginPath();
+      ctx.moveTo(sunx + Math.cos(an) * r0, suny + Math.sin(an) * r0);
+      ctx.lineTo(sunx + Math.cos(an) * r1, suny + Math.sin(an) * r1);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    var core = ctx.createRadialGradient(sunx, suny, 0, sunx, suny, 15);
+    core.addColorStop(0, col(SUNCORE)); core.addColorStop(0.6, col(GOLD));
+    core.addColorStop(1, "rgba(255,190,90,0.15)");
+    ctx.fillStyle = core;
+    ctx.beginPath(); ctx.arc(sunx, suny, 15, 0, 2*Math.PI); ctx.fill();
+    ctx.fillStyle = "rgba(255,226,158,0.92)"; ctx.font = "11px system-ui, sans-serif";
+    ctx.fillText("Sun", sunx + 20, suny + 4);
+  }
+
+  function render(t) {
+    if (!size()) return;
+    // after a few idle seconds, drift the camera back to its home pose
+    if (!dragging && performance.now() - lastInteract > 2500) {
+      var dyaw = Math.atan2(Math.sin(home.yaw - vs.yaw), Math.cos(home.yaw - vs.yaw));
+      vs.yaw += dyaw * 0.08;
+      vs.pitch += (home.pitch - vs.pitch) * 0.08;
+    }
+    var ecl = lv("physics/eclipse") >= 0.5;
+    var sun = O.sun;
+    var sr = rot(sun), sdx = sr[0], sdy = -sr[2], sl = Math.hypot(sdx, sdy) || 1;
+    var Rs = Math.min(W, H) * 0.40;
+    var sunx = cx + sdx/sl*Rs, suny = cy + sdy/sl*Rs, behind = sr[1] > 0;
+    var skyMax = H * HORIZON - 18;             // keep the sun disk out of Earth
+    if (suny > skyMax) suny = skyMax;
+
+    drawScene(ecl, t);
+    if (!ecl) drawSun(sunx, suny, behind);
+
+    var q0 = lv("physics/q0"), q1 = lv("physics/q1"),
+        q2 = lv("physics/q2"), q3 = lv("physics/q3");
+    if (q0 == null || q1 == null || q2 == null || q3 == null) {
+      ctx.fillStyle = "rgba(220,225,235,0.8)";
+      ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("awaiting attitude telemetry…", cx, H * 0.42);
+      ctx.textAlign = "left";
+      return;
+    }
+    var qm = Math.hypot(q0, q1, q2, q3) || 1;
+    var q = [q0/qm, q1/qm, q2/qm, q3/qm], A = dcm(q);
+
+    // collect bus faces + panels, paint back-to-front (painter's algorithm)
+    var prims = [];
+    faces.forEach(function (f) {
+      var neci = toEci(A, f.n), b = ecl ? 0 : Math.max(0, dot(neci, sun));
+      var pts = f.v.map(function (c) {
+        return P(toEci(A, [c[0]*BUS[0], c[1]*BUS[1], c[2]*BUS[2]])); });
+      var d = (pts[0].d + pts[1].d + pts[2].d + pts[3].d) / 4;
+      prims.push({ pts: pts, d: d, edge: true,
+        fill: col(mix(BUS_DK, BUS_LT, ecl ? 0.06 : 0.10 + 0.90*b)) });
+    });
+    var panelLit = ecl ? 0 : Math.max(0, dot(toEci(A, [0,0,1]), sun));
+    panels.forEach(function (p) {
+      var pts = p.map(function (c) { return P(toEci(A, c)); });
+      var d = (pts[0].d + pts[1].d + pts[2].d + pts[3].d) / 4;
+      prims.push({ pts: pts, d: d, panel: true, lit: panelLit,
+        fill: col(mix(PAN_DK, PAN_LT, ecl ? 0.06 : 0.10 + 0.90*panelLit)) });
+    });
+    prims.sort(function (a, b) { return a.d - b.d; });
+    prims.forEach(function (pr) {
+      ctx.beginPath();
+      ctx.moveTo(pr.pts[0].x, pr.pts[0].y);
+      for (var i = 1; i < pr.pts.length; i++) ctx.lineTo(pr.pts[i].x, pr.pts[i].y);
+      ctx.closePath();
+      ctx.fillStyle = pr.fill; ctx.fill();
+      if (pr.edge) {
+        ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1; ctx.stroke();
+      }
+      if (pr.panel) {                       // cell grid + gold sheen when lit
+        ctx.strokeStyle = "rgba(120,150,220,0.5)"; ctx.lineWidth = 0.6;
+        for (var g = 1; g < 4; g++) {
+          var ax = pr.pts[0].x + (pr.pts[1].x - pr.pts[0].x) * g/4;
+          var ay = pr.pts[0].y + (pr.pts[1].y - pr.pts[0].y) * g/4;
+          var bx = pr.pts[3].x + (pr.pts[2].x - pr.pts[3].x) * g/4;
+          var by = pr.pts[3].y + (pr.pts[2].y - pr.pts[3].y) * g/4;
+          ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+        }
+        if (pr.lit > 0.5) {
+          ctx.globalAlpha = (pr.lit - 0.5) * 1.6;
+          ctx.strokeStyle = col(GOLD); ctx.lineWidth = 1.6; ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      }
+    });
+
+    var rate = lv("physics/rate_dps");
+    if (showTech) {
+      var origin = P([0, 0, 0]);
+      // +Z panel-normal arrow: where the array is aimed (at the sun => 100%)
+      var zt = P(toEci(A, [0, 0, 1.9]));
+      ctx.setLineDash([4, 3]);
+      arrow(origin, zt.x, zt.y, col(GOLD), 1.6);
+      ctx.setLineDash([]);
+      ctx.fillStyle = col(GOLD); ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText("+Z array", zt.x + 5, zt.y);
+      // tumble indicator: spin arcs, warming past the 0.5°/s detumble gate
+      if (rate != null && rate > 0.03) {
+        var rc = rate < 0.5 ? "#5fd08a" : rate < 2.0 ? "#f5c451" : "#ef8a5a";
+        ctx.strokeStyle = rc; ctx.lineWidth = 2; ctx.globalAlpha = 0.9;
+        var rr = sc * 1.85;
+        for (var s = 0; s < 2; s++) {
+          var a0 = s*Math.PI + 0.3, a1 = s*Math.PI + 1.5;
+          ctx.beginPath(); ctx.arc(cx, cy, rr, a0, a1); ctx.stroke();
+          var hx = cx + Math.cos(a1)*rr, hy = cy + Math.sin(a1)*rr;
+          var ta = a1 + Math.PI/2;
+          ctx.beginPath(); ctx.moveTo(hx, hy);
+          ctx.lineTo(hx - 6*Math.cos(ta-0.4), hy - 6*Math.sin(ta-0.4));
+          ctx.lineTo(hx - 6*Math.cos(ta+0.4), hy - 6*Math.sin(ta+0.4));
+          ctx.closePath(); ctx.fillStyle = rc; ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    if (ecl) {                              // cool wash + label when in shadow
+      ctx.fillStyle = "rgba(18,36,84,0.30)"; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "rgba(200,210,232,0.8)"; ctx.font = "11px system-ui, sans-serif";
+      ctx.fillText("in eclipse — no sunlight", 10, H - 10);
+    }
+
+    // chips
+    var sf = lv("physics/sun_facing");
+    $("attlit").textContent = ecl ? "ECLIPSE" : "SUNLIT";
+    $("attlit").className = "chip" + (ecl ? "" : " on");
+    $("attsun").textContent = "sun " + (sf == null ? "—"
+      : Math.round(Math.max(0, sf) * 100) + "%");
+    $("attsun").className = "chip" + (sf != null && sf > 0.02 ? " on" : "");
+    $("attrate").textContent = "rate " + (rate == null ? "—"
+      : rate.toFixed(2) + " °/s");
+    $("attrate").className = "chip" + (rate != null && rate <= 0.5 ? " on" : "");
+  }
+
+  var techBtn = $("atttech");
+  if (techBtn) techBtn.addEventListener("click", function () {
+    showTech = !showTech;
+    techBtn.className = "chip" + (showTech ? " on" : "");
+    techBtn.textContent = showTech ? "tech ✓" : "tech";
+    if (reduced) render(displayTime());
+  });
+
+  var dragging = false, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", function (ev) {
+    dragging = true; lastInteract = performance.now();
+    lx = ev.clientX; ly = ev.clientY;
+    canvas.setPointerCapture(ev.pointerId);
+  });
+  canvas.addEventListener("pointermove", function (ev) {
+    if (!dragging) return;
+    vs.yaw += (ev.clientX - lx) * 0.008;
+    vs.pitch = Math.max(-1.2,
+      Math.min(1.2, vs.pitch + (ev.clientY - ly) * 0.008));
+    lx = ev.clientX; ly = ev.clientY;
+    lastInteract = performance.now();
+    if (reduced) render(displayTime());
+  });
+  canvas.addEventListener("pointerup", function () {
+    dragging = false; lastInteract = performance.now();
+  });
+  canvas.addEventListener("pointercancel", function () {
+    dragging = false; lastInteract = performance.now();
+  });
+  return { render: render };
+})();
+
 /* ---- stream ---- */
 function apply(f) {
   var st = f.status;
+  // re-anchor the smooth clock only when the sim actually advanced a tick
+  if (st.t !== state.simTime || state.tickWall === null) {
+    state.tickSimTime = st.t; state.tickWall = performance.now();
+  }
   state.simTime = st.t; state.tick = st.tick; state.paused = st.paused;
   state.speed = st.speed; state.done = st.done;
   state.statusWall = performance.now();
@@ -1872,7 +2247,8 @@ function apply(f) {
   (f.events || []).forEach(evPush);
   if (f.findings) drawFindings(f.findings);
   drawControls(); drawTiles(); drawPills(); drawLanes(); drawAllTable();
-  if (reduced) { drawClock(); globe.render(displayTime()); }
+  if (reduced) { drawClock(); globe.render(displayTime());
+                 closeup.render(displayTime()); }
 }
 var es = new EventSource("/events");
 es.onmessage = function (e) { apply(JSON.parse(e.data)); };
@@ -1883,11 +2259,13 @@ if (!reduced) {
   (function frame() {
     drawClock();
     globe.render(displayTime());
+    closeup.render(displayTime());
     requestAnimationFrame(frame);
   })();
 } else {
   drawClock();
   globe.render(0);
+  closeup.render(0);
 }
 </script>
 </body>

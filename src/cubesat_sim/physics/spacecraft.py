@@ -390,6 +390,14 @@ class SpacecraftPhysics(Component):
             self.record("charge_blocked", float(charge_blocked))
             self.record("rate_dps", float(np.rad2deg(att.rate_rad_s)))
             self.record("sun_facing", facing)
+            # body-from-ECI attitude quaternion truth (scalar-first) — the
+            # close-up view needs the real orientation, which isn't
+            # recomputable from (seed, dt). Observing truth only; no RNG or
+            # control effect, so determinism holds.
+            self.record("q0", float(att.q[0]))
+            self.record("q1", float(att.q[1]))
+            self.record("q2", float(att.q[2]))
+            self.record("q3", float(att.q[3]))
             self.record("wheel_h_frac",
                         float(np.max(np.abs(h)) / att.p.wheel_h_max_nms))
             self.record("gs_contact", float(contact))

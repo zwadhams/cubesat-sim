@@ -52,6 +52,13 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
 
 ## Backlog (agreed next steps, in rough priority)
 
+- **GUI roadmap (PROJECT_REVIEW.md Part 2) — in flight.** Phase A and
+  B1–B4 landed 2026-07-19; **next: B5**, extracting the globe to
+  `frontend/js/globe.js`, which doubles as upgrading the report globe
+  to the live console's version (coastlines, gradient terminator,
+  subsolar point) and deleting the report's old one. Then the full
+  test suite wraps Phase B; Phase C (campaign report `frontend/
+  campaign.py`, live-console 4-zone regroup) follows.
 - **FDIR experiments from campaign 1** — three findings point the same
   direction: cross-sensor consistency checks (entry #10: one frozen
   gyro fools every gate) and debounced mode transitions (entry #12:
@@ -85,8 +92,11 @@ shipped a stale binary. Recordings land in `runs/` (gitignored).
 - The teaching layer is shared by both viewers: `GLOSSARY` /
   `EVENT_GLOSS` in `frontend/dashboard.py` are the single source of truth for
   term tooltips and event definitions, shipped in both the report and
-  live-console boot payloads (the page-side `glossify` is duplicated in
-  each template — keep them in sync). `compute_annotations(db, t_end,
+  live-console boot payloads. The page-side JS both viewers share
+  (glossify/tooltips, theme toggle, severity glyphs) lives in
+  `frontend/js/*.js`, spliced into both templates at render time by
+  `dashboard.inline_js` (`__JS_<NAME>__` markers) — edit the .js files,
+  never the copies inside the templates. `compute_annotations(db, t_end,
   period)` runs the catalog-signature detectors; the report calls it
   once, the live console re-runs it every ~3 s as the flight grows
   (findings can refine/withdraw — honest for a live feed). Detectors

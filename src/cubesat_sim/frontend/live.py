@@ -35,8 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cubesat_sim.frontend.dashboard import DIGITAL_TRACKS, ANALOG_LANES, EVENT_GLOSS, \
-    GLOSSARY, _fmt_detail, _orbit_geometry, _severity, compute_annotations, \
-    parse_catalog
+    GLOSSARY, SKIP_EVENT_KINDS, _fmt_detail, _orbit_geometry, _severity, \
+    compute_annotations, inline_js, load_flight, parse_catalog, render_html
 from cubesat_sim.frontend.coastline import COASTLINE
 from cubesat_sim.environment.orbit import CircularOrbit
 from cubesat_sim.linkdump import describe_link_message
@@ -167,6 +167,7 @@ def _boot_common(title: str, mode: str, meta: dict) -> dict:
         "pills": [{"source": s, "key": k, "label": lb}
                   for s, k, lb in DIGITAL_TRACKS],
         "gloss": GLOSSARY, "evgloss": EVENT_GLOSS, "catalog": parse_catalog(),
+        "skipkinds": sorted(SKIP_EVENT_KINDS),
     }
 
 
@@ -233,6 +234,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(self.page)
         elif self.path.startswith("/events"):
             self._stream()
+        elif self.path == "/report" or self.path.startswith("/report?"):
+            self._report()
         else:
             self.send_error(404)
 
@@ -304,6 +307,26 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(409, "inject queue full")
             return False
         return True
+
+    # -- the flight report so far ---------------------------------------------
+
+    def _report(self):
+        """Render the full flight-report dashboard from the recording as
+        it stands right now — the same self-contained page render_flight
+        writes, built on demand. WAL lets this read run beside the
+        recorder's writes; each request is a fresh snapshot, so a late
+        joiner gets full scrub/zoom/history without any live-page state."""
+        try:
+            html = render_html(load_flight(self.db_path)).encode()
+        except Exception as exc:  # surface it to the tab, not a dead socket
+            self.send_error(500, f"report failed: {type(exc).__name__}")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(html)
 
     # -- the tail ------------------------------------------------------------
 
@@ -452,8 +475,8 @@ class Console:
             self._worker = threading.Thread(
                 target=fly, args=(self.sim, self.ctl, duration), daemon=True)
         blob = json.dumps(boot, separators=(",", ":")).replace("</", "<\\/")
-        page = (_PAGE.replace("__TITLE__", boot["title"])
-                .replace("__BOOT__", blob)).encode()
+        page = inline_js(_PAGE.replace("__TITLE__", boot["title"])
+                         .replace("__BOOT__", blob)).encode()
         handler = type("BoundHandler", (_Handler,), {
             "ctl": self.ctl, "db_path": str(self.db_path), "page": page,
             "live": self.sim is not None})
@@ -589,11 +612,13 @@ header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
          margin: 4px 2px 12px; }
 header h1 { font-size: 19px; font-weight: 650; margin: 0; }
 header .chips { color: var(--ink-2); font-size: 12.5px; }
-header button {
-  margin-left: auto; font: inherit; font-size: 12.5px; color: var(--ink-2);
+header button, header a.hbtn {
+  font: inherit; font-size: 12.5px; color: var(--ink-2);
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 7px; padding: 3px 10px; cursor: pointer;
+  text-decoration: none;
 }
+header a.hbtn { margin-left: auto; }
 .conn { width: 9px; height: 9px; border-radius: 50%; align-self: center;
         background: var(--muted); flex: none; }
 .conn.ok { background: var(--good); }
@@ -660,8 +685,13 @@ header button {
 .ev { padding: 1.5px 0; color: var(--ink-2);
       font-variant-numeric: tabular-nums; }
 .ev b { color: var(--ink); font-weight: 600; }
-.sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-       margin-right: 6px; }
+.ev.routine { display: none; }
+#events.showroutine .ev.routine { display: block; }
+/* severity glyphs match the report's event timeline: shape + color,
+   never color alone */
+.sev { display: inline-block; width: 13px; margin-right: 3px;
+       font-size: 10px; text-align: center; }
+.fnone { padding: 5px 2px 3px; font-size: 12px; color: var(--muted); }
 .lane { margin-bottom: 4px; }
 .lane-head { display: flex; align-items: baseline; gap: 8px; margin: 8px 2px 2px;
              flex-wrap: wrap; }
@@ -794,6 +824,8 @@ summary { cursor: pointer; font-size: 12.5px; }
     <h1>__TITLE__</h1>
     <span class="chips" id="metachips"></span>
     <span class="conn" id="conn" title="stream"></span>
+    <a class="hbtn" id="reportbtn" href="/report" target="_blank" rel="noopener"
+       title="render the full flight report from the recording so far — scrub, zoom, tables, every channel">flight report so far</a>
     <button id="themebtn" type="button">theme: auto</button>
   </header>
 
@@ -830,10 +862,12 @@ summary { cursor: pointer; font-size: 12.5px; }
 
   <div class="tiles" id="tiles"></div>
 
-  <div class="card" id="findingscard" style="display:none">
+  <div class="card" id="findingscard">
     <div class="card-head"><h2>What happened</h2>
       <span class="zinfo">auto-detected as the flight unfolds</span></div>
-    <div class="findings" id="findings"></div></div>
+    <div class="findings" id="findings"><div class="fnone">no findings yet
+      &mdash; the catalog detectors sweep the flight every few
+      seconds</div></div></div>
 
   <div class="duo">
     <div class="card">
@@ -864,13 +898,20 @@ summary { cursor: pointer; font-size: 12.5px; }
         <span class="chip" id="atttech" style="cursor:pointer"
               title="show orientation cues">tech</span>
       </div>
+      <div class="glegend">
+        <span>the true recorded orientation &mdash; faces are lit by the
+        real sun direction, and eclipse genuinely darkens the craft;
+        &ldquo;tech&rdquo; overlays the array-pointing arrow and tumble
+        arcs</span></div>
     </div>
   </div>
 
   <div class="card">
     <h2>Spacecraft state</h2>
     <div class="pills" id="pills"></div>
-    <h2 style="margin:14px 0 6px">Events</h2>
+    <h2 style="margin:14px 0 6px">Events
+      <span class="chip" id="routinetgl" style="cursor:pointer"
+            title="also show routine transitions (eclipse, passes, charge inhibit)">routine</span></h2>
     <div class="feed" id="events"></div>
   </div>
 
@@ -966,123 +1007,30 @@ function fmt(v) {
   return v.toFixed(3);
 }
 function pad(n) { return (n < 10 ? "0" : "") + n; }
-function sevColor(sev) {
-  return css({ critical: "--critical", warning: "--warning",
-               good: "--good" }[sev] || "--muted");
-}
+__JS_GLYPH__
 
-/* ---- glossary: every term of art teaches itself on hover ----
-   Mirrors the flight-report dashboard. One dictionary (BOOT.gloss) feeds
-   the primer grid and dotted-underline .term spans wrapped around matches
-   in visible text; event kinds get BOOT.evgloss in the event feed. */
+/* ---- glossary (shared module, mirrors the flight report): BOOT.gloss
+   feeds the primer grid and dotted-underline .term spans; event kinds
+   get BOOT.evgloss in the event feed. */
 var GLOSS = BOOT.gloss || {}, EVGLOSS = BOOT.evgloss || {};
-var ALIAS = { "ground contact": "pass", "load shed": "load shed" };
-var GLOSS_LC = {}, tooltip = $("tooltip"), termActive = false;
-function normTerm(s) { return String(s).toLowerCase().replace(/-/g, " "); }
-Object.keys(GLOSS).forEach(function (k) { GLOSS_LC[normTerm(k)] = k; });
-function defFor(name) {
-  var lc = normTerm(name);
-  if (ALIAS[lc]) lc = normTerm(ALIAS[lc]);
-  var k = GLOSS_LC[lc];
-  return k ? { name: k, def: GLOSS[k] } : null;
-}
-function termRegex(keys, flags) {
-  keys = keys.slice().sort(function (a, b) { return b.length - a.length; });
-  var alts = keys.map(function (k) {
-    return k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[ -]/g, "[ -]");
-  });
-  return new RegExp("(^|[^A-Za-z0-9_-])(" + alts.join("|") +
-                    ")((?:es|s)?)(?![A-Za-z0-9_-])", flags);
-}
-var _acr = [], _phr = [];
-Object.keys(GLOSS).forEach(function (k) {
-  (/[A-Z]/.test(k) ? _acr : _phr).push(k);
-});
-var reACR = _acr.length ? termRegex(_acr, "") : null;
-var rePHR = _phr.length ? termRegex(_phr, "i") : null;
-function glossifyNode(textNode) {
-  var s = textNode.nodeValue, out = [], pos = 0, hits = 0;
-  while (pos < s.length) {
-    var rest = s.slice(pos), bm = null, bat = Infinity;
-    [reACR, rePHR].forEach(function (re) {
-      if (!re) return;
-      var m = rest.match(re);
-      if (m && m.index + m[1].length < bat) { bat = m.index + m[1].length; bm = m; }
-    });
-    if (!bm) break;
-    var start = pos + bat, len = bm[2].length + bm[3].length;
-    var d = defFor(bm[2]);
-    if (d) {
-      out.push(s.slice(pos, start));
-      out.push({ text: s.slice(start, start + len), d: d });
-      hits++;
-    } else {
-      out.push(s.slice(pos, start + len));
-    }
-    pos = start + len;
-  }
-  if (!hits) return;
-  out.push(s.slice(pos));
-  var frag = document.createDocumentFragment();
-  out.forEach(function (o) {
-    if (typeof o === "string") { if (o) frag.appendChild(document.createTextNode(o)); return; }
-    var sp = document.createElement("span");
-    sp.className = "term"; sp.textContent = o.text;
-    sp.dataset.name = o.d.name; sp.dataset.def = o.d.def;
-    frag.appendChild(sp);
-  });
-  textNode.parentNode.replaceChild(frag, textNode);
-}
-function glossify(root) {
-  if (!root) return;
-  var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-  var nodes = [];
-  while (walker.nextNode()) {
-    var p = walker.currentNode.parentNode;
-    if (p.closest && p.closest(".term,.gloss,.evkind,.catchip,script,style")) continue;
-    nodes.push(walker.currentNode);
-  }
-  nodes.forEach(glossifyNode);
-}
-function placeTip(ev) {
-  var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
-  var x = ev.clientX + 14, y = ev.clientY + 12;
-  if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
-  if (y + th > window.innerHeight - 8) y = ev.clientY - th - 12;
-  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
-}
-function showTermTip(ev, name, def) {
-  tooltip.textContent = "";
-  div("tt-t", tooltip, name);
-  div("tt-d", tooltip, def);
-  tooltip.style.display = "block";
-  placeTip(ev);
-}
-document.addEventListener("mouseover", function (ev) {
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
-});
-document.addEventListener("mouseout", function (ev) {
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = false; tooltip.style.display = "none"; }
-});
-document.addEventListener("click", function (ev) {  // touch: tap toggles
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
-  else if (termActive) { termActive = false; tooltip.style.display = "none"; }
-});
+var SKIPK = {};
+(BOOT.skipkinds || []).forEach(function (k) { SKIPK[k] = 1; });
+__JS_GLOSSARY__
 
 /* ---- findings: catalog signatures the server streams as they fire ---- */
 var CAT = BOOT.catalog || {};
 function drawFindings(notes) {
-  var card = $("findingscard"), host = $("findings");
+  var host = $("findings");
   if (!notes) return;
-  card.style.display = notes.length ? "" : "none";
   host.textContent = "";
+  if (!notes.length) {  // keep the card in place — no layout jump
+    div("fnone", host, "no findings yet — the catalog detectors sweep " +
+        "the flight every few seconds");
+    return;
+  }
   notes.forEach(function (n) {
     var row = div("finding" + (n.new ? " isnew" : ""), host);
-    div("fsev", row).style.background = n.new ? sevColor("critical")
-                                              : sevColor(n.sev);
+    div("fsev", row).style.background = sevCss(n.new ? "critical" : n.sev);
     var main = div("fmain", row);
     var body = div("ftext", main);
     if (n.new) {
@@ -1125,22 +1073,9 @@ function drawFindings(notes) {
   glossify(document.querySelector(".intro"));
 })();
 
-/* ---- theme ---- */
-(function () {
-  var KEY = "cubesat-live-theme", modes = ["auto", "light", "dark"];
-  var cur = localStorage.getItem(KEY) || "auto";
-  function apply() {
-    if (cur === "auto") document.documentElement.removeAttribute("data-theme");
-    else document.documentElement.setAttribute("data-theme", cur);
-    $("themebtn").textContent = "theme: " + cur;
-  }
-  $("themebtn").addEventListener("click", function () {
-    cur = modes[(modes.indexOf(cur) + 1) % 3];
-    localStorage.setItem(KEY, cur);
-    apply();
-  });
-  apply();
-})();
+/* ---- theme (shared module; persisted per viewer) ---- */
+var THEME_KEY = "cubesat-live-theme";
+__JS_THEME__
 
 /* ---- state ---- */
 var state = {
@@ -1173,6 +1108,8 @@ $("metachips").textContent =
   "seed " + BOOT.meta.seed + " · dt " + BOOT.meta.dt + " s · plan " +
   (BOOT.meta.duration_s / PERIOD).toFixed(1) + " orbits";
 $("lanewin").textContent = "rolling window · last 1.5 orbits";
+// a replay serves a finished recording, so the report is just "the report"
+if (BOOT.mode === "replay") $("reportbtn").textContent = "flight report";
 
 /* ---- control strip ---- */
 function post(body) {
@@ -1611,13 +1548,12 @@ function linkPush(m) {
 
 /* ---- event ticker ---- */
 function evPush(ev) {
-  var line = div("ev", null);
-  var dot = document.createElement("span");
-  dot.className = "sev";
-  var col = { good: "--good", warning: "--warning",
-              critical: "--critical" }[ev.sev] || "--muted";
-  dot.style.background = "var(" + col + ")";
-  line.appendChild(dot);
+  var line = div("ev" + (SKIPK[ev.kind] ? " routine" : ""), null);
+  var g = document.createElement("span");
+  g.className = "sev";
+  g.textContent = sevGlyph(ev.sev);
+  g.style.color = sevCss(ev.sev);
+  line.appendChild(g);
   line.appendChild(document.createTextNode(
     "orbit " + (ev.t / PERIOD).toFixed(2) + " · "));
   var b = document.createElement("b");
@@ -1641,6 +1577,10 @@ function evPush(ev) {
   host.insertBefore(line, host.firstChild);
   while (host.childNodes.length > 300) host.removeChild(host.lastChild);
 }
+$("routinetgl").addEventListener("click", function () {
+  var on = this.classList.toggle("on");
+  $("events").classList.toggle("showroutine", on);
+});
 
 /* ---- orbit globe (adapted from the flight-report dashboard) ---- */
 var globe = (function () {

@@ -2,10 +2,11 @@
 
 Reads a flight recorder .db and renders a static report — stat tiles, a
 digital state strip (eclipse / contact / safe mode / shedding ...), an
-event timeline with severity glyphs, and analog telemetry lanes with a
-shared crosshair — into a single HTML file with zero external
-dependencies (inline CSS/JS, data embedded as JSON). Open it in any
-browser; light/dark follow the OS with a manual toggle.
+event timeline with severity glyphs, analog telemetry lanes with a
+shared crosshair, and an all-channels browser that can chart any
+recorded (source, key) on demand — into a single HTML file with zero
+external dependencies (inline CSS/JS, data embedded as JSON). Open it in
+any browser; light/dark follow the OS with a manual toggle.
 
 The report teaches itself: GLOSSARY terms grow dotted-underline hover
 tooltips wherever they appear (tiles, hints, legends, row labels), the
@@ -30,8 +31,10 @@ or programmatically: `render_flight("runs/foo.db")` -> Path to the HTML.
 Chart rules of the house (see the dataviz method this follows): one unit
 per lane — never a dual axis; color is assigned by entity in fixed slot
 order (truth first, estimate second); status colors are reserved for
-event severity and always ride with a glyph and a label; every chart has
-a table-view twin.
+event severity and always ride with a glyph and a label; hover teaches
+but never gates — every lane twins as a table of the current zoom
+window (the "table" toggle in its header) with a CSV export beside it,
+and the event timeline twins as the event log.
 """
 
 from __future__ import annotations
@@ -83,9 +86,11 @@ ANALOG_LANES = [
     ]),
     ("Temperatures", "Power & thermal",
      "Li-ion cells must stay above 0 °C to charge; the battery heater "
-     "spends watts to keep them there.",
+     "spends watts to keep them there. The controller only sees the "
+     "noisy measured line — watch it disagree with the truth.",
      "°C", None, [
         ("physics", "t_batt_k", "battery", _K2C),
+        ("thermal", "battery_temp_k", "measured", _K2C),
         ("physics", "t_struct_k", "structure", _K2C),
     ]),
     ("Body rate", "Attitude",
@@ -101,6 +106,13 @@ ANALOG_LANES = [
      "cosine", (-1.0, 1.0), [
         ("physics", "sun_facing", "panel · sun", _ID),
     ]),
+    ("Sun pointing error", "Attitude",
+     "The ADCS's own report of how far the panel points off the sun — "
+     "the control error behind sun-point mode. −1 means its sun sensor "
+     "sees nothing (eclipse or anti-sun): the ADCS is flying blind.",
+     "deg", None, [
+        ("adcs", "sun_err_deg", "ADCS reported", _ID),
+    ]),
     ("Wheel momentum", "Attitude",
      "Momentum stored in the reaction wheels; near 1.0 they saturate and "
      "the magnetorquers must dump momentum.",
@@ -110,11 +122,14 @@ ANALOG_LANES = [
     ]),
     ("Data", "Data & link",
      "Imaging fills the onboard queue; passes drain it to the ground "
-     "archive; overflow when full is dropped forever.",
+     "archive; overflow when full is dropped forever. Generated is "
+     "everything captured since launch — the gap above the archive is "
+     "science still stranded onboard.",
      "MB", None, [
         ("comms", "queue_mb", "onboard queue", _ID),
         ("ground", "archive_mb", "ground archive", _ID),
         ("comms", "dropped_mb", "dropped", _ID),
+        ("payload", "generated_mb", "generated", _ID),
     ]),
     ("Link", "Data & link",
      "Cumulative counts: frames the ground rejected (CRC), frame-counter "
@@ -139,15 +154,96 @@ ANALOG_LANES = [
 
 DIGITAL_TRACKS = [
     ("physics", "eclipse", "eclipse"),
+    ("faults", "in_saa", "in SAA"),
     ("physics", "gs_contact", "ground contact"),
     ("physics", "target_visible", "target visible"),
     ("payload", "imaging", "imaging"),
     ("obc", "safe_mode", "safe mode"),
+    ("ground", "sat_safe_mode", "believed SAFE"),
     ("eps", "shedding", "load shed"),
+    ("ground", "sat_shedding", "believed shed"),
     ("physics", "charge_blocked", "charge inhibit"),
     ("thermal", "heater_request", "heater request"),
     ("adcs", "mode_sun_point", "sun-point mode"),
 ]
+
+# The all-channels browser embeds every recorded (source, key); this map
+# gives the known ones a unit and a one-line hint. Values are raw (no
+# transforms — temperatures stay in kelvin here; the curated lanes carry
+# the °C story). Unknown keys still render, with the raw name and no
+# unit — a future channel appears in the browser with zero code changes.
+CHANNEL_META = {
+    "physics/soc_true": ("fraction", "true state of charge"),
+    "physics/p_gen_w": ("W", "true solar generation"),
+    "physics/p_load_w": ("W", "true total load"),
+    "physics/battery_v_true": ("V", "true battery terminal voltage"),
+    "physics/t_batt_k": ("K", "true battery temperature"),
+    "physics/t_struct_k": ("K", "true structure temperature"),
+    "physics/rate_dps": ("deg/s", "true body rotation rate"),
+    "physics/sun_facing": ("cosine", "panel · sun; 1 full sun, negative "
+                           "anti-sun"),
+    "physics/wheel_h_frac": ("frac of max", "true stored wheel momentum"),
+    "physics/batt_capacity_wh": ("Wh", "true battery capacity after cycle "
+                                 "aging"),
+    "physics/array_illum": ("illumination", "true array health after "
+                            "radiation darkening and debris"),
+    "physics/eclipse": ("0/1", "in Earth's shadow"),
+    "physics/gs_contact": ("0/1", "a ground station is above the contact "
+                           "elevation gate"),
+    "physics/target_visible": ("0/1", "an imaging target is above its "
+                               "elevation gate"),
+    "physics/charge_blocked": ("0/1", "charging inhibited — battery below "
+                               "the li-ion 0 °C limit"),
+    "physics/tx_w": ("W", "radio transmit power draw — airtime made "
+                     "visible in the power budget"),
+    "physics/link_ber": ("ratio", "channel bit-error rate; only sampled "
+                         "while a link exists"),
+    "physics/q0": ("", "attitude quaternion, scalar part (body-from-ECI) — "
+                   "meaningful in the attitude view, not as a line"),
+    "physics/q1": ("", "attitude quaternion x (body-from-ECI)"),
+    "physics/q2": ("", "attitude quaternion y (body-from-ECI)"),
+    "physics/q3": ("", "attitude quaternion z (body-from-ECI)"),
+    "eps/soc_est": ("fraction", "EPS state-of-charge estimate — voltage-"
+                    "derived, sags under load"),
+    "eps/shedding": ("0/1", "EPS load shed active"),
+    "adcs/rate_dps": ("deg/s", "ADCS body-rate estimate — whatever the "
+                      "gyro says, lies included"),
+    "adcs/sun_err_deg": ("deg", "ADCS reported sun-pointing error; −1 "
+                         "means its sun sensor sees nothing"),
+    "adcs/wheel_frac": ("frac of max", "ADCS estimate of stored wheel "
+                        "momentum"),
+    "adcs/mode_sun_point": ("0/1", "ADCS is in sun-point mode"),
+    "obc/safe_mode": ("0/1", "OBC safe mode active"),
+    "obc/fdir_cycles": ("count", "FDIR ADCS power cycles used — 3 means "
+                        "it gave up"),
+    "comms/queue_mb": ("MB", "onboard downlink queue depth"),
+    "comms/sent_mb": ("MB", "science transmitted, cumulative"),
+    "comms/dropped_mb": ("MB", "science dropped on queue overflow, "
+                         "cumulative — gone forever"),
+    "comms/tc_ack": ("count", "last accepted TC sequence number (FARM)"),
+    "comms/carrier": ("0/1", "radio carrier keyed — transmitting"),
+    "thermal/battery_temp_k": ("K", "measured battery temperature — what "
+                               "the heater controller sees"),
+    "thermal/heater_request": ("0/1", "thermal asking the EPS for battery-"
+                               "heater power"),
+    "payload/imaging": ("0/1", "instrument capturing"),
+    "payload/generated_mb": ("MB", "science captured since launch, "
+                             "cumulative"),
+    "ground/archive_mb": ("MB", "science safely on the ground"),
+    "ground/sat_soc_est": ("fraction", "ground's last-heard SoC estimate — "
+                           "stale between passes"),
+    "ground/sat_safe_mode": ("0/1", "ground's belief the OBC is in SAFE — "
+                             "stale between passes"),
+    "ground/sat_shedding": ("0/1", "ground's belief the EPS is shedding — "
+                            "stale between passes"),
+    "ground/telemetry_frames": ("count", "TM frames received, cumulative"),
+    "ground/frames_ok": ("count", "frames decoded clean, cumulative"),
+    "ground/frames_rejected": ("count", "frames failing CRC, cumulative"),
+    "ground/seq_gaps": ("count", "frame-counter gaps noticed, cumulative"),
+    "ground/tc_retransmits": ("count", "commands retransmitted, "
+                              "cumulative"),
+    "faults/in_saa": ("0/1", "inside the South Atlantic Anomaly box"),
+}
 
 # events that the bands/tracks already tell better than markers would
 SKIP_EVENT_KINDS = {
@@ -234,6 +330,12 @@ GLOSSARY = {
             "horizon — the only time the link exists",
     "beacon": "the periodic housekeeping TM frame — one packet per "
               "subsystem, the ground's whole picture of the spacecraft",
+    "believed SAFE": "the ground's belief that the OBC is in safe mode — "
+                     "rebuilt from the last decoded beacon, so it lags "
+                     "truth and goes stale between passes",
+    "believed shed": "the ground's belief that the EPS is shedding "
+                     "loads — from the last decoded beacon, stale "
+                     "between passes",
     "TM": "telemetry — downlink transfer frames (sync marker, counters, "
           "CRC)",
     "TC": "telecommand — an uplinked command frame, retransmitted until "
@@ -249,6 +351,8 @@ GLOSSARY = {
            "sensor word",
     "SAA": "South Atlantic Anomaly — a radiation hotspot where the SEU "
            "rate jumps ~25×",
+    "in SAA": "inside the South Atlantic Anomaly box — the SEU rate is "
+              "~25× while the band lasts",
     "FDIR": "fault detection, isolation, recovery — here, a gyro "
             "watchdog that power-cycles the ADCS, three attempts max",
     "latch-up": "a sensor stuck repeating one output word; soft ones "
@@ -333,6 +437,9 @@ EVENT_GLOSS = {
     "sunlight",
     "contact_aos": "acquisition of signal — pass begins",
     "contact_los": "loss of signal — pass ends",
+    "contact_handover": "the link switched to a better-placed ground "
+                        "station mid-pass — several antennas, one ops "
+                        "center",
     "charge_inhibit_on": "battery below 0 °C — charging blocked",
     "charge_inhibit_off": "battery warm enough to charge again",
 }
@@ -700,11 +807,14 @@ def load_flight(db_path: str | Path) -> dict:
                     tracks.append({"label": label, "intervals": iv})
 
         events = []
+        n_safe = 0
         for tick, t, source, kind, detail_json in db.execute(
                 "SELECT tick, time, source, kind, detail FROM events ORDER BY tick"):
             if kind in SKIP_EVENT_KINDS:
                 continue
             detail = json.loads(detail_json) if detail_json else {}
+            if kind == "mode_change" and detail.get("to") == "SAFE":
+                n_safe += 1
             events.append({"t": _round(t), "source": source, "kind": kind,
                            "severity": _severity(kind, detail),
                            "detail": _fmt_detail(detail)})
@@ -715,8 +825,6 @@ def load_flight(db_path: str | Path) -> dict:
         archive = _series(db, "ground", "archive_mb")
         dropped = _series(db, "comms", "dropped_mb")
         n_brownouts = sum(1 for e in events if e["kind"] == "brownout")
-        n_safe = sum(1 for e in events
-                     if e["kind"] == "mode_change" and "to=SAFE" in e["detail"])
         n_cycles = sum(1 for e in events if e["kind"] == "fdir_adcs_power_cycle")
         gave_up = any(e["kind"] == "fdir_giveup" for e in events)
         n_faults = sum(1 for e in events if e["kind"] == "inject")
@@ -748,6 +856,18 @@ def load_flight(db_path: str | Path) -> dict:
                           "value": f"{cap[-1][1]:.2f} Wh",
                           "note": f"array at {illum[-1][1]:.3f}"})
 
+        # the all-channels browser: every recorded (source, key),
+        # downsampled — ~0.5 MB for a 19 h flight, capped by MAX_BUCKETS
+        # regardless of flight length
+        channels = []
+        for source, key in db.execute(
+                "SELECT DISTINCT source, key FROM telemetry "
+                "WHERE value IS NOT NULL ORDER BY source, key"):
+            unit, hint = CHANNEL_META.get(f"{source}/{key}", ("", ""))
+            channels.append({"source": source, "key": key, "unit": unit,
+                             "hint": hint,
+                             "points": _downsample(_series(db, source, key))})
+
         epoch_iso = json.loads(meta["epoch"]) if "epoch" in meta else None
         stations = json.loads(meta["stations"]) if "stations" in meta else None
         targets = json.loads(meta["targets"]) if "targets" in meta else None
@@ -762,6 +882,7 @@ def load_flight(db_path: str | Path) -> dict:
             "tracks": tracks,
             "events": events,
             "lanes": lanes,
+            "channels": channels,
             "annotations": annotations,
             "catalog": parse_catalog(),
             "orbit3d": _orbit_geometry(epoch_iso, stations, targets),
@@ -816,15 +937,36 @@ def _orbit_geometry(
     }
 
 
+_JS_DIR = Path(__file__).parent / "js"
+_JS_MODULES = ("glossary", "theme", "glyph")
+
+
+def inline_js(html: str) -> str:
+    """Splice the shared page modules (frontend/js/*.js) into a rendered
+    template — each __JS_<NAME>__ marker becomes the file's text, so the
+    pages stay self-contained single files with no build step. The live
+    console uses this on its page too; the .js files are the single
+    source of truth for logic both viewers share."""
+    for name in _JS_MODULES:
+        html = html.replace(f"__JS_{name.upper()}__",
+                            (_JS_DIR / f"{name}.js").read_text(encoding="utf-8"))
+    return html
+
+
+def render_html(payload: dict) -> str:
+    """The report page for a `load_flight` payload. Shared by
+    `render_flight` (writes a file) and the live console's GET /report
+    (renders the recording-so-far on demand)."""
+    blob = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    return inline_js(_TEMPLATE
+                     .replace("__TITLE__", payload["title"])
+                     .replace("__FLIGHT_JSON__", blob))
+
+
 def render_flight(db_path: str | Path, out_path: str | Path | None = None) -> Path:
     db_path = Path(db_path)
     out_path = Path(out_path) if out_path else db_path.with_suffix(".html")
-    payload = load_flight(db_path)
-    blob = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
-    html = (_TEMPLATE
-            .replace("__TITLE__", payload["title"])
-            .replace("__FLIGHT_JSON__", blob))
-    out_path.write_text(html, encoding="utf-8")
+    out_path.write_text(render_html(load_flight(db_path)), encoding="utf-8")
     return out_path
 
 
@@ -937,6 +1079,15 @@ svg text.axsub { font-size: 9.5px; fill: var(--muted); }
 .legend .key { display: inline-block; width: 14px; height: 0;
                border-top: 2.5px solid; border-radius: 2px;
                vertical-align: middle; margin-right: 5px; }
+.lane-head .csvbtn { font: inherit; font-size: 10.5px; color: var(--muted);
+                     background: none; border: 1px solid var(--border);
+                     border-radius: 6px; padding: 1px 7px; cursor: pointer;
+                     margin-left: 10px; }
+.lane-head .csvbtn:hover { color: var(--ink-2); }
+.lane-head .csvbtn.on { color: var(--ink); border-color: var(--s1); }
+.lane-table { max-height: 320px; overflow-y: auto; margin: 0 0 10px; }
+.lane-table table { margin-top: 2px; }
+.lane-table th { position: sticky; top: 0; background: var(--surface); }
 svg { display: block; }
 svg text { font: 10.5px system-ui, -apple-system, "Segoe UI", sans-serif;
            fill: var(--muted); font-variant-numeric: tabular-nums; }
@@ -1012,6 +1163,18 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
             font-size: 12px; color: var(--ink-2); }
 .catpanel .catmech { margin-bottom: 6px; }
 .catpanel .catstatus { color: var(--muted); font-size: 11.5px; }
+/* all-channels browser: source-grouped key chips, ad-hoc lanes above */
+.chandetails { margin: 2px 0; color: var(--ink-2); }
+.chandetails summary { font-size: 12.5px; }
+.changrp { display: flex; gap: 10px; align-items: baseline; margin: 8px 0; }
+.changrp .src { flex: none; min-width: 64px; text-align: right;
+                font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.chankeys { display: flex; flex-wrap: wrap; gap: 6px; }
+.chanchip { font-size: 11.5px; color: var(--muted); border: 1px solid
+            var(--border); border-radius: 999px; padding: 2px 9px;
+            cursor: pointer; white-space: nowrap; user-select: none; }
+.chanchip:hover { color: var(--ink-2); }
+.chanchip.on { color: var(--ink); border-color: var(--s1); }
 /* event-log severity filter chips */
 .evchips { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .evchip { font-size: 11.5px; color: var(--muted); border: 1px solid
@@ -1103,6 +1266,17 @@ svg text.hasdef { text-decoration: underline dotted; cursor: help; }
       <span class="zinfo">hover an event name for what it means</span>
       <span class="evchips" id="evchips"></span></div>
     <div id="evtable"></div></div>
+  <div class="card" id="chancard">
+    <div class="card-head"><h2>All channels</h2>
+      <span class="zinfo" id="chaninfo"></span>
+      <button id="chancsv" type="button"
+        title="download every channel below — display resolution; the
+recording (.db) keeps every sample">CSV all</button></div>
+    <div id="adhoc"></div><div id="xaxis-adhoc"></div>
+    <details class="chandetails">
+      <summary>browse every recorded channel — click a key to chart it</summary>
+      <div id="chanchips"></div>
+    </details></div>
 </div>
 <div id="tooltip"></div>
 <script type="application/json" id="flight-data">__FLIGHT_JSON__</script>
@@ -1113,8 +1287,7 @@ var PERIOD = DATA.meta.period_s, T_END = Math.max(DATA.meta.duration_s, 1);
 var VIEW = { t0: 0, t1: T_END };  // zoom window; survives rebuilds
 var PADL = 112, PADR = 14;        // label gutter; recomputed per build
 var SERIES = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)"];
-var SEV = { critical: "var(--critical)", warning: "var(--warning)",
-            good: "var(--good)", neutral: "var(--muted)" };
+__JS_GLYPH__
 var NS = "http://www.w3.org/2000/svg";
 var charts = [];   // {svg, plotW, update(tOrNull)}
 var orbitUI = null;  // orbit view state; survives chart rebuilds
@@ -1180,109 +1353,11 @@ function fitText(node, maxW) {
   }
 }
 
-/* ---- glossary: every term of art teaches itself on hover ----
-   One dictionary (DATA.gloss) feeds the primer grid, inline .term spans
-   wrapped around matches in visible text, and the row labels of the
-   state strip / event timeline. Event kinds get their own dictionary
-   (DATA.evgloss) in the event log. */
+/* ---- glossary (shared module): DATA.gloss feeds the primer grid,
+   inline .term spans, and the row labels of the state strip / event
+   timeline; DATA.evgloss covers event kinds in the event log. */
 var GLOSS = DATA.gloss || {}, EVGLOSS = DATA.evgloss || {};
-var ALIAS = { "ground contact": "pass" };
-var GLOSS_LC = {};
-function normTerm(s) { return String(s).toLowerCase().replace(/-/g, " "); }
-Object.keys(GLOSS).forEach(function (k) { GLOSS_LC[normTerm(k)] = k; });
-function defFor(name) {
-  var lc = normTerm(name);
-  if (ALIAS[lc]) lc = normTerm(ALIAS[lc]);
-  var k = GLOSS_LC[lc];
-  return k ? { name: k, def: GLOSS[k] } : null;
-}
-function termRegex(keys, flags) {
-  keys = keys.slice().sort(function (a, b) { return b.length - a.length; });
-  var alts = keys.map(function (k) {
-    return k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[ -]/g, "[ -]");
-  });
-  // leading boundary is a captured group (no lookbehind for reach);
-  // an optional trailing "s"/"es" lets "SEUs" and "passes" resolve
-  return new RegExp("(^|[^A-Za-z0-9_-])(" + alts.join("|") +
-                    ")((?:es|s)?)(?![A-Za-z0-9_-])", flags);
-}
-var _acr = [], _phr = [];
-Object.keys(GLOSS).forEach(function (k) {
-  (/[A-Z]/.test(k) ? _acr : _phr).push(k);
-});
-var reACR = _acr.length ? termRegex(_acr, "") : null;      // case matters
-var rePHR = _phr.length ? termRegex(_phr, "i") : null;     // it doesn't
-
-function glossifyNode(textNode) {
-  var s = textNode.nodeValue, out = [], pos = 0, hits = 0;
-  while (pos < s.length) {
-    var rest = s.slice(pos), bm = null, bat = Infinity;
-    [reACR, rePHR].forEach(function (re) {
-      if (!re) return;
-      var m = rest.match(re);
-      if (m && m.index + m[1].length < bat) {
-        bat = m.index + m[1].length; bm = m;
-      }
-    });
-    if (!bm) break;
-    var start = pos + bat, len = bm[2].length + bm[3].length;
-    var d = defFor(bm[2]);
-    if (d) {
-      out.push(s.slice(pos, start));
-      out.push({ text: s.slice(start, start + len), d: d });
-      hits++;
-    } else {
-      out.push(s.slice(pos, start + len));
-    }
-    pos = start + len;
-  }
-  if (!hits) return;
-  out.push(s.slice(pos));
-  var frag = document.createDocumentFragment();
-  out.forEach(function (o) {
-    if (typeof o === "string") {
-      if (o) frag.appendChild(document.createTextNode(o));
-      return;
-    }
-    var sp = document.createElement("span");
-    sp.className = "term"; sp.textContent = o.text;
-    sp.dataset.name = o.d.name; sp.dataset.def = o.d.def;
-    frag.appendChild(sp);
-  });
-  textNode.parentNode.replaceChild(frag, textNode);
-}
-function glossify(root) {
-  if (!root) return;
-  var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-  var nodes = [];
-  while (walker.nextNode()) {
-    var p = walker.currentNode.parentNode;
-    if (p.closest && p.closest(".term,.gloss,.evkind,.catchip,script,style")) continue;
-    nodes.push(walker.currentNode);
-  }
-  nodes.forEach(glossifyNode);
-}
-var termActive = false;
-function showTermTip(ev, name, def) {
-  tooltip.textContent = "";
-  div("tt-t", tooltip).textContent = name;
-  div("tt-d", tooltip).textContent = def;
-  tooltip.style.display = "block";
-  placeTip(ev);
-}
-document.addEventListener("mouseover", function (ev) {
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
-});
-document.addEventListener("mouseout", function (ev) {
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = false; tooltip.style.display = "none"; }
-});
-document.addEventListener("click", function (ev) {  // touch: tap toggles
-  var t = ev.target.closest && ev.target.closest(".term");
-  if (t) { termActive = true; showTermTip(ev, t.dataset.name, t.dataset.def); }
-  else if (termActive) { termActive = false; tooltip.style.display = "none"; }
-});
+__JS_GLOSSARY__
 /* SVG row labels can't hold .term spans; give the whole label a hover */
 function svgDef(node, label) {
   var d = defFor(label);
@@ -1417,9 +1492,13 @@ function drawEvents() {
   });
 }
 
-/* ---- analog lanes ---- */
-function drawLane(lane) {
-  var host = div("lane", document.getElementById("lanes"));
+/* ---- analog lanes ----
+   `parent` defaults to the curated telemetry card; the all-channels
+   browser reuses this for its ad-hoc lanes (passing onRemove for the
+   dismiss button) so they share the crosshair, zoom, and CSV plumbing */
+var TABLED = {};  // lane title -> table twin open; survives rebuilds
+function drawLane(lane, parent, onRemove) {
+  var host = div("lane", parent || document.getElementById("lanes"));
   var head = div("lane-head", host);
   var ttl = div("t", head); ttl.textContent = lane.title;
   var unit = div("u", head); unit.textContent = lane.unit;
@@ -1433,6 +1512,30 @@ function drawLane(lane) {
       item.appendChild(document.createTextNode(s.label));
       lg.appendChild(item);
     });
+  }
+  var csv = document.createElement("button");
+  csv.className = "csvbtn"; csv.type = "button"; csv.textContent = "CSV";
+  csv.title = "download this lane's series — display resolution; " +
+              "every sample lives in the recording (.db)";
+  if (lane.series.length < 2) csv.style.marginLeft = "auto";
+  csv.addEventListener("click", function () { laneCsv(lane); });
+  head.appendChild(csv);
+  var tbl = document.createElement("button");
+  tbl.className = "csvbtn"; tbl.type = "button"; tbl.textContent = "table";
+  tbl.title = "twin this chart as a table of the current zoom window";
+  tbl.classList.toggle("on", !!TABLED[lane.title]);
+  tbl.addEventListener("click", function () {
+    TABLED[lane.title] = !TABLED[lane.title];
+    tbl.classList.toggle("on", !!TABLED[lane.title]);
+    renderTwin();
+  });
+  head.appendChild(tbl);
+  if (onRemove) {
+    var rm = document.createElement("button");
+    rm.className = "csvbtn"; rm.type = "button"; rm.textContent = "✕";
+    rm.title = "remove this lane";
+    rm.addEventListener("click", onRemove);
+    head.appendChild(rm);
   }
   if (lane.hint) {
     var hint = div("hint", host);
@@ -1483,6 +1586,131 @@ function drawLane(lane) {
       if (p) tt.push([SERIES[i], s.label, fmt(p[1]) + " " + lane.unit]);
     });
   });
+
+  var twin = div("lane-table", host);
+  function renderTwin() {
+    twin.textContent = "";
+    if (TABLED[lane.title]) { laneTable(lane, twin); glossify(twin); }
+  }
+  renderTwin();
+}
+
+/* the embedded series as a file — display resolution (min/max bucketed);
+   the .db keeps every sample */
+function csvQuote(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
+function downloadCsv(rows, name) {
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([rows.join("\n") + "\n"],
+                                        { type: "text/csv" }));
+  a.download = name.replace(/[^\w ().-]+/g, "_");
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+}
+function laneCsv(lane) {
+  var rows = ["series,t_s,value (" + lane.unit + ")"];
+  lane.series.forEach(function (s) {
+    s.points.forEach(function (p) {
+      rows.push(csvQuote(s.label) + "," + p[0] + "," + p[1]);
+    });
+  });
+  downloadCsv(rows, DATA.title + " " + lane.title + " downsampled.csv");
+}
+
+/* the chart's table twin: rows are the union of in-window timestamps
+   across the lane's series (each downsampled independently, so a blank
+   cell means that series has no sample at that instant) */
+var TABLE_MAX_ROWS = 300;
+function laneTable(lane, host) {
+  var seen = {};
+  lane.series.forEach(function (s) {
+    s.points.forEach(function (p) {
+      if (p[0] >= VIEW.t0 && p[0] <= VIEW.t1) seen[p[0]] = true;
+    });
+  });
+  var times = Object.keys(seen).map(Number);
+  times.sort(function (a, b) { return a - b; });
+  if (!times.length) {
+    div("hint", host).textContent = "no samples in the zoom window";
+    return;
+  }
+  if (times.length > TABLE_MAX_ROWS) {
+    div("hint", host).textContent =
+      times.length + " rows in this window — zoom to narrow below " +
+      TABLE_MAX_ROWS + ", or take the CSV for the whole series";
+    return;
+  }
+  var byT = lane.series.map(function (s) {
+    var m = {};
+    s.points.forEach(function (p) { m[p[0]] = p[1]; });
+    return m;
+  });
+  var table = document.createElement("table");
+  var tr = document.createElement("tr");
+  ["orbit", "t (s)"].concat(lane.series.map(function (s) {
+    return lane.unit ? s.label + " (" + lane.unit + ")" : s.label;
+  })).forEach(function (h) {
+    var th = document.createElement("th"); th.textContent = h;
+    tr.appendChild(th);
+  });
+  table.appendChild(tr);
+  times.forEach(function (t) {
+    var row = document.createElement("tr");
+    function td(txt) {
+      var c = document.createElement("td");
+      c.className = "num"; c.textContent = txt; row.appendChild(c);
+    }
+    td(orbits(t).toFixed(2));
+    td(String(t));
+    byT.forEach(function (m) { td(t in m ? fmt(m[t]) : ""); });
+    table.appendChild(row);
+  });
+  host.appendChild(table);
+}
+
+/* ---- all-channels browser: every recorded (source,key), chartable ----
+   The payload embeds every channel downsampled, so nothing in the
+   recording is out of reach. A clicked chip spawns an ad-hoc lane that
+   goes through the same buildAll pipeline as the curated ones — same
+   crosshair, same zoom window, same CSV button. */
+var CHANNELS = DATA.channels || [];
+var CHAN_BY_ID = {}, CHIP_BY_ID = {};
+CHANNELS.forEach(function (c) { CHAN_BY_ID[c.source + "/" + c.key] = c; });
+var ADHOC = [];  // spawned channel ids, in click order; survives rebuilds
+
+function chanLane(ch) {
+  return { title: ch.source + "/" + ch.key, hint: ch.hint || "",
+           unit: ch.unit || "", domain: null,
+           series: [{ label: ch.key, points: ch.points }] };
+}
+function toggleChan(id) {
+  var i = ADHOC.indexOf(id);
+  if (i >= 0) ADHOC.splice(i, 1); else ADHOC.push(id);
+  var chip = CHIP_BY_ID[id];
+  if (chip) chip.classList.toggle("on", i < 0);
+  buildAll();
+}
+function drawAdhoc() {
+  var host = document.getElementById("adhoc");
+  var ax = document.getElementById("xaxis-adhoc");
+  host.textContent = ""; ax.textContent = "";
+  if (!ADHOC.length) return;
+  ADHOC.forEach(function (id) {
+    var ch = CHAN_BY_ID[id];
+    if (ch) drawLane(chanLane(ch), host,
+                     function () { toggleChan(id); });
+  });
+  drawXAxis("xaxis-adhoc");
+  glossify(host);
+}
+function allChannelsCsv() {
+  var rows = ["source,key,t_s,value"];
+  CHANNELS.forEach(function (c) {
+    c.points.forEach(function (p) {
+      rows.push(csvQuote(c.source) + "," + csvQuote(c.key) + "," +
+                p[0] + "," + p[1]);
+    });
+  });
+  downloadCsv(rows, DATA.title + " all channels downsampled.csv");
 }
 
 function nearest(points, t) {
@@ -1917,8 +2145,8 @@ function drawOrbitView() {
   if (vs.playing) raf = requestAnimationFrame(frame);
 }
 
-/* ---- crosshair + tooltip + drag-to-zoom, shared across every chart ---- */
-var tooltip = document.getElementById("tooltip");
+/* ---- crosshair + drag-to-zoom, shared across every chart (the tooltip
+   element and placeTip come from the glossary module) ---- */
 function setView(t0, t1) {
   t0 = Math.max(0, t0);
   t1 = Math.min(T_END, t1);
@@ -1987,13 +2215,6 @@ function attachCrosshair(svg, plotW, h, fill) {
 function hideCross() {
   charts.forEach(function (c) { c.line.setAttribute("visibility", "hidden"); });
   if (!termActive) tooltip.style.display = "none";
-}
-function placeTip(ev) {
-  var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
-  var x = ev.clientX + 14, y = ev.clientY + 12;
-  if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
-  if (y + th > window.innerHeight - 8) y = ev.clientY - th - 12;
-  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
 }
 function showTooltip(ev, t, rows) {
   tooltip.textContent = "";
@@ -2151,16 +2372,9 @@ function drawEventTable() {
   glossify(table);
 }
 
-/* ---- theme toggle ---- */
-var themebtn = document.getElementById("themebtn");
-var themes = ["auto", "light", "dark"], themeIdx = 0;
-themebtn.addEventListener("click", function () {
-  themeIdx = (themeIdx + 1) % 3;
-  var t = themes[themeIdx];
-  if (t === "auto") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", t);
-  themebtn.textContent = "theme: " + t;
-});
+/* ---- theme toggle (shared module; persisted per viewer) ---- */
+var THEME_KEY = "cubesat-report-theme";
+__JS_THEME__
 
 var lastBuildWidth = 0;
 function updateZoomUI() {
@@ -2193,7 +2407,7 @@ function buildAll() {
     drawLane(lane);
   });
   drawXAxis("xaxis-top"); drawXAxis("xaxis");
-  drawEventTable(); updateZoomUI();
+  drawEventTable(); drawAdhoc(); updateZoomUI();
   glossify(document.getElementById("lanes"));
   glossify(document.getElementById("chips"));
 }
@@ -2229,6 +2443,51 @@ function buildAll() {
     });
     chips.appendChild(c);
   });
+
+  // the all-channels browser chips, grouped by source; each chip
+  // teaches itself on hover via the same tooltip the glossary uses
+  if (!CHANNELS.length) {
+    document.getElementById("chancard").style.display = "none";
+    return;
+  }
+  document.getElementById("chaninfo").textContent =
+    CHANNELS.length + " recorded channels · display resolution — the "
+    + "recording (.db) keeps every sample";
+  var chost = document.getElementById("chanchips");
+  var bySrc = {};
+  CHANNELS.forEach(function (c) {
+    (bySrc[c.source] = bySrc[c.source] || []).push(c);
+  });
+  Object.keys(bySrc).forEach(function (src) {
+    var row = div("changrp", chost);
+    var lab = div("src", row); lab.textContent = src;
+    var sd = defFor(src);
+    if (sd) {
+      lab.classList.add("term");
+      lab.dataset.name = sd.name; lab.dataset.def = sd.def;
+    }
+    var keys = div("chankeys", row);
+    bySrc[src].forEach(function (c) {
+      var id = src + "/" + c.key;
+      var chip = document.createElement("span");
+      chip.className = "chanchip"; chip.textContent = c.key;
+      var def = (c.hint || "no description yet — raw recorded channel")
+        + (c.unit ? " · " + c.unit : "");
+      chip.addEventListener("pointerenter", function (ev) {
+        termActive = true; showTermTip(ev, id, def);
+      });
+      chip.addEventListener("pointerleave", function () {
+        termActive = false; tooltip.style.display = "none";
+      });
+      chip.addEventListener("click", function (ev) {
+        ev.stopPropagation(); toggleChan(id);
+      });
+      CHIP_BY_ID[id] = chip;
+      keys.appendChild(chip);
+    });
+  });
+  document.getElementById("chancsv")
+    .addEventListener("click", allChannelsCsv);
 })();
 document.getElementById("zoomreset").addEventListener("click", resetView);
 /* zoom / pan buttons: zoom about the window center, pan by 30% of span.

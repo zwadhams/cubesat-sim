@@ -3,7 +3,7 @@
 import json
 import re
 
-from cubesat_sim.frontend.dashboard import load_flight, render_flight
+from cubesat_sim.frontend.dashboard import load_flight, render_flight, render_html
 from cubesat_sim.faults import sensor_stuck
 from cubesat_sim.mission import build_sim
 
@@ -66,6 +66,47 @@ def test_render_is_self_contained_html(tmp_path):
     assert 'src="' not in html and "@import" not in html
 
 
+def test_shared_js_modules_inlined_once(tmp_path):
+    """The frontend/js modules are spliced into the report exactly once
+    each, and no __JS_ marker survives to the page."""
+    html = render_flight(make_recording(tmp_path)).read_text()
+    for name in ("glossary", "theme", "glyph"):
+        assert html.count(f"cubesat shared js module: {name}") == 1
+    assert "__JS_" not in html
+
+
+def test_js_modules_parse(tmp_path):
+    """node --check the shared modules and the whole assembled report
+    script — a syntax error in a module would break both viewers."""
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    from cubesat_sim.frontend import dashboard
+    js_dir = Path(dashboard.__file__).parent / "js"
+    files = sorted(js_dir.glob("*.js"))
+    assert len(files) == 3
+    html = render_flight(make_recording(tmp_path)).read_text()
+    body = re.search(r"<script>(.*)</script>", html, re.S).group(1)
+    script = tmp_path / "report_script.js"
+    script.write_text(body, encoding="utf-8")
+    for f in files + [script]:
+        subprocess.run(["node", "--check", str(f)], check=True)
+
+
+def test_render_html_is_the_shared_renderer(tmp_path):
+    """render_flight is a thin file-writer over render_html — the live
+    console's GET /report calls render_html directly, so the two paths
+    must produce the identical page."""
+    db = make_recording(tmp_path)
+    out = render_flight(db, tmp_path / "twin.html")
+    assert out.read_text(encoding="utf-8") == render_html(load_flight(db))
+
+
 def test_glossary_covers_what_renders(tmp_path):
     """The teaching layer must not have holes: every event kind, state
     channel, and event source that can appear in a report has a
@@ -83,6 +124,96 @@ def test_glossary_covers_what_renders(tmp_path):
         assert tr["label"].lower() in gloss_lc | {"ground contact"}, tr["label"]
     for s in {e["source"] for e in data["events"]}:
         assert s in gloss_lc, s
+
+    # static: every curated track label teaches itself, including the
+    # ones this sample flight can't exercise (beliefs need a decoded
+    # beacon, the SAA band a nonzero SEU rate)
+    from cubesat_sim.frontend.dashboard import DIGITAL_TRACKS, GLOSSARY
+    all_gloss_lc = {k.lower() for k in GLOSSARY}
+    for _src, _key, label in DIGITAL_TRACKS:
+        assert label.lower() in all_gloss_lc | {"ground contact"}, label
+    assert "contact_handover" in EVENT_GLOSS  # multi-station flights emit it
+
+
+def test_phase_a_curated_channels():
+    """The truth-vs-measured and truth-vs-belief stories are curated:
+    the noisy battery temp the controller acts on rides beside the truth,
+    the ADCS's own pointing error gets a lane, generated science joins
+    the Data conservation story, and the ground's stale beliefs sit as
+    tracks directly beside the truths they shadow."""
+    from cubesat_sim.frontend.dashboard import ANALOG_LANES, DIGITAL_TRACKS
+    series = {(src, key) for *_, spec in ANALOG_LANES
+              for src, key, _label, _tf in spec}
+    assert ("thermal", "battery_temp_k") in series
+    assert ("adcs", "sun_err_deg") in series
+    assert ("payload", "generated_mb") in series
+    labels = [label for _src, _key, label in DIGITAL_TRACKS]
+    assert labels.index("believed SAFE") == labels.index("safe mode") + 1
+    assert labels.index("believed shed") == labels.index("load shed") + 1
+    assert "in SAA" in labels
+
+
+def test_lane_csv_and_theme_persist(tmp_path):
+    """Phase-A affordances ride in the template: every lane header
+    carries a CSV download of its embedded series, and the theme choice
+    survives a reload."""
+    html = render_flight(make_recording(tmp_path)).read_text()
+    assert "laneCsv" in html and "csvbtn" in html
+    assert "cubesat-report-theme" in html
+
+
+def test_channel_browser_embeds_every_channel(tmp_path):
+    """B1: the report is no longer curated-only — every recorded
+    (source, key) rides in the payload downsampled, so any channel can
+    be charted ad hoc without going back to the .db."""
+    import sqlite3
+    from cubesat_sim.frontend.dashboard import CHANNEL_META, MAX_BUCKETS
+    db_path = make_recording(tmp_path)
+    data = load_flight(db_path)
+    con = sqlite3.connect(db_path)
+    recorded = set(con.execute(
+        "SELECT DISTINCT source, key FROM telemetry WHERE value IS NOT NULL"))
+    con.close()
+    embedded = {(c["source"], c["key"]) for c in data["channels"]}
+    assert embedded == recorded
+    for c in data["channels"]:
+        assert len(c["points"]) <= 2 * MAX_BUCKETS
+        assert all(v is not None for _, v in c["points"])
+        # known channels carry their unit and teaching hint
+        if f"{c['source']}/{c['key']}" in CHANNEL_META:
+            assert c["hint"]
+
+
+def test_channel_meta_covers_the_curated_channels():
+    """Every channel a curated lane or track charts must also be
+    explained in the browser; meta entries are well-formed (a hint is
+    mandatory, a unit may be blank — quaternions are unitless)."""
+    from cubesat_sim.frontend.dashboard import (
+        ANALOG_LANES, CHANNEL_META, DIGITAL_TRACKS)
+    for *_, spec in ANALOG_LANES:
+        for src, key, _label, _tf in spec:
+            assert f"{src}/{key}" in CHANNEL_META, (src, key)
+    for src, key, _label in DIGITAL_TRACKS:
+        assert f"{src}/{key}" in CHANNEL_META, (src, key)
+    for cid, (unit, hint) in CHANNEL_META.items():
+        assert "/" in cid and hint, cid
+
+
+def test_channel_browser_in_template(tmp_path):
+    """The browser card ships in the rendered page: chips, ad-hoc lane
+    plumbing, and the export-all button."""
+    html = render_flight(make_recording(tmp_path)).read_text()
+    assert "All channels" in html and "chanchip" in html
+    assert "drawAdhoc" in html and "allChannelsCsv" in html
+
+
+def test_lane_table_twin_in_template(tmp_path):
+    """B2: every lane — curated and ad-hoc alike, both render through
+    drawLane — can twin as a table of the current zoom window, capped
+    with a zoom-to-narrow hint; the toggle survives rebuilds."""
+    html = render_flight(make_recording(tmp_path)).read_text()
+    assert "laneTable" in html and "TABLED" in html
+    assert "TABLE_MAX_ROWS" in html and "zoom to narrow" in html
 
 
 def test_annotations_detect_the_confident_corpse():

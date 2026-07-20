@@ -72,6 +72,13 @@ def test_console_page_and_controls(tmp_path):
             assert resp.status == 200
             page = resp.read().decode()
         assert "Spacecraft bus" in page and "orbit3d" in page
+        # the close-up attitude view lives beside the orbit globe
+        assert 'id="closeup"' in page and "Attitude" in page
+        # ticker filters routine kinds (toggleable), findings card holds
+        # its place before the first sweep, attitude view explains itself
+        assert 'id="routinetgl"' in page and "skipkinds" in page
+        assert "no findings yet" in page
+        assert "true recorded orientation" in page
 
         assert _post(con.url, {"action": "pause"}) == 204
         _wait(lambda: con.ctl.paused)
@@ -109,6 +116,57 @@ def test_ticks_visible_while_flying(tmp_path):
         n2 = ro.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0]
         ro.close()
         assert n2 > n1
+    finally:
+        con.stop()
+
+
+def test_shared_js_modules_inlined_once(tmp_path):
+    """The console page splices in the same frontend/js modules as the
+    report — each exactly once, with no __JS_ marker surviving; when
+    node is on the box, the assembled script must also parse."""
+    import re
+    import shutil
+    import subprocess
+
+    con = Console(db=tmp_path / "live.db", port=0, speed=1.0,
+                  duration=600.0, dt=5.0, seed=0, **LIGHT).start()
+    try:
+        with _get(con.url) as resp:
+            page = resp.read().decode()
+    finally:
+        con.stop()
+    for name in ("glossary", "theme", "glyph"):
+        assert page.count(f"cubesat shared js module: {name}") == 1
+    assert "__JS_" not in page
+    if shutil.which("node"):
+        body = re.search(r"<script>(.*)</script>", page, re.S).group(1)
+        script = tmp_path / "live_script.js"
+        script.write_text(body, encoding="utf-8")
+        subprocess.run(["node", "--check", str(script)], check=True)
+
+
+def test_flight_report_so_far(tmp_path):
+    """GET /report renders the full static dashboard from the recording
+    as it stands, while the mission is still in the air (a WAL read
+    beside the recorder's writes), and the header links to it."""
+    db = tmp_path / "live.db"
+    con = Console(db=db, port=0, speed=60.0, duration=3000.0, dt=5.0,
+                  seed=1, **LIGHT).start()
+    try:
+        with _get(con.url) as resp:
+            page = resp.read().decode()
+        assert 'id="reportbtn"' in page and 'href="/report"' in page
+
+        _wait(lambda: con.ctl.tick >= 3)
+        assert not con.ctl.done
+        with _get(con.url + "report", timeout=30.0) as resp:
+            assert resp.status == 200
+            assert "text/html" in resp.headers.get("Content-Type", "")
+            report = resp.read().decode()
+        assert "flight report</title>" in report
+        assert "__FLIGHT_JSON__" not in report  # markers all substituted
+        assert '"channels":' in report  # the all-channels browser rides along
+        assert '"soc_true"' in report  # real telemetry made it in
     finally:
         con.stop()
 
@@ -223,6 +281,26 @@ def test_command_panel_reaches_the_sim(tmp_path):
         ro.close()
     finally:
         con.stop()
+
+
+def test_attitude_quaternion_recorded(tmp_path):
+    """Physics records the true body-from-ECI quaternion (q0..q3) so the
+    close-up view can draw the real orientation — it isn't recomputable
+    from (seed, dt). All four series land, aligned in time and unit-norm."""
+    db = tmp_path / "flight.db"
+    sim = build_sim(dt=5.0, seed=6, recorder_path=db, **LIGHT)
+    sim.run(duration=120.0)
+    series = {k: sim.recorder.telemetry(source="physics", key=k)
+              for k in ("q0", "q1", "q2", "q3")}
+    sim.close()
+
+    assert all(rows for rows in series.values()), "a quaternion series is empty"
+    lengths = {len(rows) for rows in series.values()}
+    assert len(lengths) == 1, "quaternion components logged at different rates"
+    # each recorded quaternion is a unit quaternion (rows are tick,time,...,value)
+    for i in range(len(series["q0"])):
+        n = math.hypot(*(series[k][i][4] for k in ("q0", "q1", "q2", "q3")))
+        assert abs(n - 1.0) < 1e-6
 
 
 def test_findings_stream_over_replay(tmp_path):

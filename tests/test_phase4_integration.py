@@ -93,3 +93,39 @@ def test_uplink_commands_arrive_only_during_contact():
     for e in dispatched:
         assert json.loads(e[4])["cmd_topic"] == "payload/enable"
     sim.close()
+
+
+def test_second_station_downlinks_more_and_stays_in_contact():
+    """A ground station near the imaging AOI closes the coverage gap a lone
+    mid-latitude station leaves: materially more captured science reaches the
+    ground, contacts happen via both stations, and every delivery still lands
+    inside a contact window."""
+    from cubesat_sim.physics.spacecraft import DEFAULT_STATION, TOKYO_STATION
+
+    def archived(sim):
+        r = sim.recorder.telemetry("ground", "archive_mb")
+        return r[-1][4] if r else 0.0
+
+    base = build_sim(dt=5.0, seed=1)
+    base.run(duration=8 * orbit_period(base))
+    dual = build_sim(dt=5.0, seed=1, stations=[DEFAULT_STATION, TOKYO_STATION])
+    dual.run(duration=8 * orbit_period(dual))
+
+    # the second station brings materially more data home (~2.4x here)
+    assert archived(dual) > 1.5 * archived(base)
+
+    # and it actually carried traffic: contacts happen via both stations
+    stations = {json.loads(e[4])["station"]
+                for e in dual.recorder.events("physics")
+                if e[3] == "contact_aos"}
+    assert {"bozeman", "tokyo_gs"} <= stations
+
+    # invariant preserved with two stations: no delivery outside a contact
+    contact = {r[0]: r[4] for r in dual.recorder.telemetry("physics", "gs_contact")}
+    rx = dual.recorder.messages(topic="radio/rx_ground")
+    assert rx
+    for row in rx:
+        assert contact.get(row[0]) == 1.0
+
+    base.close()
+    dual.close()
